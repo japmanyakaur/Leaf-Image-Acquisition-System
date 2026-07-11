@@ -14,16 +14,20 @@ CONTROLS (while the preview window is focused)
     q  - quit (offers to save best frame from the session if none was
          auto-captured yet)
     s  - force-save the current frame right now
-    c  - calibration mode: hold a leaf at a KNOWN distance and press c,
-         then type the distance in metres into the terminal. Do this at
-         3+ different distances (e.g. 0.2, 0.5, 1.0, 2.0 m) across
-         multiple runs. After 3+ points the script fits a physical
-         area-vs-distance curve and gives you real distance estimates
-         instead of a rough near/optimal/far heuristic.
+    t  - AUTO-TUNE: do this once per new environment/leaf setup. Hold a
+         leaf where it looks good and press t; the system learns its own
+         capture thresholds from what it sees. Auto-exposure (below) runs
+         independently and doesn't need this step.
+    c  - calibration mode (optional, cosmetic only): shows real distance
+         in metres instead of just near/far. Not required for capture.
     r  - reset the stability counter (if you got a false "hold steady")
-    i / k - increase / decrease camera exposure (if the feed is too
-            dark or too bright and CLAHE alone can't fix it)
-    o / l - increase / decrease camera brightness
+    a  - toggle automatic exposure on/off. It's ON by default and
+         continuously adjusts exposure/gain/brightness by itself in ANY
+         environment (indoor or outdoor) - no setup needed. Pressing any
+         manual key below pauses it automatically; press 'a' to resume.
+    i / k - manually raise / lower exposure (secondary - overrides auto)
+    o / l - manually raise / lower brightness (secondary - overrides auto)
+    g / h - manually raise / lower sensor gain (secondary - overrides auto)
 
 OUTPUT
     Captured frames go to ./captures/leaf_YYYYMMDD_HHMMSS_scoreXXX.jpg
@@ -82,16 +86,6 @@ class Config:
     # --- HSV range for green leaf segmentation (broad, override if needed) ---
     hsv_lower: tuple = (20, 25, 25)
     hsv_upper: tuple = (95, 255, 255)
-
-    # --- Startup exposure/brightness for this specific webcam+lighting ---
-    # Found via live testing with the i/k/o/l keys: this driver's default
-    # (EXPOSURE=-6) was too dark to detect anything. -1 is this driver's
-    # ceiling (least-negative = longest shutter = brightest); 60 is near its
-    # brightness ceiling too. Re-tune these two values if you change rooms,
-    # lighting setup, or webcam - just watch the printed driver values while
-    # pressing i/k/o/l and hardcode whatever worked.
-    startup_exposure: float = -1.0
-    startup_brightness: float = 60.0
 
 
 # --------------------------------------------------------------------------- #
@@ -294,7 +288,71 @@ class Guidance:
     PERFECT = "Perfect Position"
 
 
-def decide_guidance(cfg: Config, area_ratio, brightness, sharpness, vein_score, leaf_found):
+class AdaptiveThresholds:
+    """Learns 'what good looks like' continuously from live use instead of
+    requiring an explicit calibration step. This lens is fixed-focus, so
+    there IS one real sharp distance you have to find by moving the leaf -
+    no software removes that physical fact. But the system can discover
+    that sweet spot itself from the values it actually observes as you
+    naturally move the leaf around (which the on-screen guidance already
+    encourages), rather than you having to judge and confirm it. Starts
+    from a generic safe fallback for the first couple of seconds, then
+    switches to self-learned targets - no button press required, though
+    't' still exists as an optional fast-track if you want to skip the
+    wait by confirming one good example."""
+
+    def __init__(self, min_samples=20, max_samples=600,
+                 sharp_fraction=0.80, vein_fraction=0.80,
+                 motion_percentile=40, motion_margin=1.8):
+        self.sharp_samples = []
+        self.vein_samples = []
+        self.motion_samples = []
+        self.min_samples = min_samples
+        self.max_samples = max_samples
+        self.sharp_fraction = sharp_fraction
+        self.vein_fraction = vein_fraction
+        self.motion_percentile = motion_percentile
+        self.motion_margin = motion_margin
+
+    def update(self, sharpness, vein_score, motion):
+        self.sharp_samples.append(sharpness)
+        self.vein_samples.append(vein_score)
+        self.motion_samples.append(motion)
+        for lst in (self.sharp_samples, self.vein_samples, self.motion_samples):
+            if len(lst) > self.max_samples:
+                del lst[:len(lst) - self.max_samples]
+
+    def seed(self, sharpness, vein_score, motion, repeats=15):
+        """Optional fast-track: inject a user-confirmed good example
+        several times so targets jump to it immediately instead of waiting
+        to be organically discovered."""
+        for _ in range(repeats):
+            self.update(sharpness, vein_score, motion)
+
+    @property
+    def ready(self):
+        return len(self.sharp_samples) >= self.min_samples
+
+    def sharp_target(self, fallback):
+        if not self.ready:
+            return fallback
+        return float(np.percentile(self.sharp_samples, 90)) * self.sharp_fraction
+
+    def vein_target(self, fallback):
+        if not self.ready:
+            return fallback
+        return float(np.percentile(self.vein_samples, 90)) * self.vein_fraction
+
+    def motion_target(self, fallback):
+        if len(self.motion_samples) < self.min_samples:
+            return fallback
+        # Low percentile = the calmer moments even within a session that
+        # includes movement, i.e. an estimate of the real noise floor.
+        return float(np.percentile(self.motion_samples, self.motion_percentile)) * self.motion_margin
+
+
+def decide_guidance(cfg: Config, area_ratio, brightness, sharpness, vein_score,
+                     leaf_found, sharp_thresh, vein_thresh):
     if not leaf_found:
         return Guidance.NO_LEAF, False
 
@@ -308,10 +366,10 @@ def decide_guidance(cfg: Config, area_ratio, brightness, sharpness, vein_score, 
     if brightness > cfg.max_brightness:
         return Guidance.REDUCE_LIGHT, False
 
-    if sharpness < cfg.sharpness_threshold:
+    if sharpness < sharp_thresh:
         return Guidance.HOLD_STEADY, False
 
-    if vein_score < cfg.vein_score_threshold:
+    if vein_score < vein_thresh:
         return Guidance.ADJUST_FINE, False
 
     return Guidance.PERFECT, True
@@ -356,16 +414,14 @@ def open_camera(cfg: Config):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
 
-    # NOTE: we deliberately do NOT force CAP_PROP_AUTO_EXPOSURE here.
-    # DirectShow's value convention for this property is inconsistent across
-    # webcam drivers (some treat "3" as auto, others as a manual mode with a
-    # very low fixed exposure) - forcing it can silently lock a camera into
-    # near-black frames. Instead we apply known-good manual exposure/
-    # brightness values (tuned live for this webcam - see Config) and let
-    # the user nudge further with the i/k/o/l keys if lighting changes.
-    cap.set(cv2.CAP_PROP_EXPOSURE, cfg.startup_exposure)
-    cap.set(cv2.CAP_PROP_BRIGHTNESS, cfg.startup_brightness)
-
+    # NOTE: we deliberately do NOT force any startup exposure/brightness
+    # values here, and do NOT force CAP_PROP_AUTO_EXPOSURE (DirectShow's
+    # convention for it is inconsistent across drivers and forcing it can
+    # silently lock a camera into a bad manual state). Instead,
+    # AutoExposureController takes over immediately after the warm-up loop
+    # and proportionally drives exposure/gain/brightness toward a good
+    # target from whatever the driver happens to boot at - this is what
+    # makes it work unmodified in any new environment, indoor or outdoor.
     print("Camera property support (driver-dependent, -1 means unsupported):")
     for name, prop in [("AUTO_EXPOSURE", cv2.CAP_PROP_AUTO_EXPOSURE),
                         ("EXPOSURE", cv2.CAP_PROP_EXPOSURE),
@@ -376,12 +432,96 @@ def open_camera(cfg: Config):
     return cap
 
 
-def nudge_camera_property(cap, prop, delta, label):
+def nudge_camera_property(cap, prop, delta, label, quiet=False):
     current = cap.get(prop)
     new_val = current + delta
     cap.set(prop, new_val)
     actual = cap.get(prop)
-    print(f"  [{label}] requested {new_val:.2f}, driver reports {actual:.2f}")
+    if not quiet:
+        print(f"  [{label}] requested {new_val:.2f}, driver reports {actual:.2f}")
+    return actual
+
+
+class AutoExposureController:
+    """Drives the webcam toward a FIXED, universal well-exposed brightness
+    target - not one derived from any per-room auto-tune - so it works the
+    same whether you're indoors under a lamp or outdoors in daylight, with
+    zero manual setup. This is the "automatic" mode; the i/k/o/l keys
+    remain available any time you want to override it by hand.
+
+    Design:
+    - Checks the RAW incoming frame (before software CLAHE correction),
+      since we're driving the actual sensor, not the display.
+    - Adjustment size is PROPORTIONAL to how far off target the frame is,
+      so it corrects a small day-to-day drift in a couple of steps but
+      also recovers quickly from something drastic (e.g. walking from a
+      dim room into full sun) instead of crawling there one unit at a time.
+    - Uses exposure (shutter) as the primary lever, but when exposure is
+      already at the driver's limit and more brightness is still needed,
+      switches to sensor GAIN instead. Gain adds brightness without
+      lengthening the shutter, so it doesn't add motion-blur risk -
+      important since a longer shutter directly hurts the vein/sharpness
+      score this whole system is judged on. Gain trades a little sensor
+      noise for that safety, which is the right trade for a static leaf
+      shot. BRIGHTNESS is used as a smaller final trim.
+    """
+
+    TARGET_LOW = 110.0
+    TARGET_HIGH = 165.0
+    TARGET_MID = (TARGET_LOW + TARGET_HIGH) / 2
+
+    def __init__(self, check_interval_frames: int = 6, max_step: float = 3.0):
+        self.check_interval = check_interval_frames
+        self.max_step = max_step
+        self.frame_count = 0
+        self.enabled = True
+        self.last_status = "auto-exposure: warming up"
+
+    def maybe_adjust(self, cap, raw_gray):
+        if not self.enabled:
+            self.last_status = "auto-exposure: PAUSED (manual mode - press 'a' to resume)"
+            return
+
+        self.frame_count += 1
+        if self.frame_count % self.check_interval != 0:
+            return
+
+        mean = float(np.mean(raw_gray))
+
+        if self.TARGET_LOW <= mean <= self.TARGET_HIGH:
+            self.last_status = f"auto-exposure: stable (raw mean {mean:.0f})"
+            return
+
+        error = self.TARGET_MID - mean          # positive => too dark
+        direction = 1.0 if error > 0 else -1.0
+        magnitude = min(abs(error) / 15.0, self.max_step)  # proportional, capped
+
+        cur_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+        cap.set(cv2.CAP_PROP_EXPOSURE, cur_exp + direction * magnitude)
+        applied_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+        exposure_hit_limit = abs(applied_exp - cur_exp) < 0.05
+
+        applied_gain = cap.get(cv2.CAP_PROP_GAIN)
+        applied_bri = cap.get(cv2.CAP_PROP_BRIGHTNESS)
+
+        if exposure_hit_limit and direction > 0:
+            # Shutter can't get any longer - brighten via gain instead so
+            # sharpness doesn't keep degrading.
+            cur_gain = cap.get(cv2.CAP_PROP_GAIN)
+            cap.set(cv2.CAP_PROP_GAIN, cur_gain + magnitude * 4)
+            applied_gain = cap.get(cv2.CAP_PROP_GAIN)
+        elif exposure_hit_limit and direction < 0:
+            cur_bri = cap.get(cv2.CAP_PROP_BRIGHTNESS)
+            cap.set(cv2.CAP_PROP_BRIGHTNESS, cur_bri - magnitude * 4)
+            applied_bri = cap.get(cv2.CAP_PROP_BRIGHTNESS)
+        else:
+            cur_bri = cap.get(cv2.CAP_PROP_BRIGHTNESS)
+            cap.set(cv2.CAP_PROP_BRIGHTNESS, cur_bri + direction * magnitude * 2)
+            applied_bri = cap.get(cv2.CAP_PROP_BRIGHTNESS)
+
+        word = "raising" if direction > 0 else "lowering"
+        self.last_status = (f"auto-exposure: {word} (raw mean {mean:.0f} -> "
+                             f"exp {applied_exp:.1f}, gain {applied_gain:.1f}, bri {applied_bri:.1f})")
 
 
 def auto_gamma_correct(bgr, target_mean=140.0):
@@ -429,6 +569,9 @@ def main():
         cap.read()
         time.sleep(0.03)
 
+    exposure_ctrl = AutoExposureController()
+    adaptive = AdaptiveThresholds()
+
     stability_hist = deque(maxlen=cfg.stability_frames_required)
     prev_gray_full = None
     last_capture_time = 0.0
@@ -440,29 +583,53 @@ def main():
     tuning_start = 0.0
     TUNING_DURATION_SEC = 1.5
 
-    print("Ready. Controls: q=quit  s=manual save  t=AUTO-TUNE (do this first!)  "
-          "c=calibrate distance (optional)  r=reset stability  i/k=exposure +/-  o/l=brightness +/-")
+    last_status_print = 0.0
+
+    print("Ready. Automatic exposure is running - point at a leaf, no setup needed.")
+    print("The system learns its own sharpness/detail/steadiness targets live as you use it -")
+    print("just move the leaf slowly until guidance says 'Perfect Position'. No calibration required.")
+    print("Controls: q=quit  s=manual save  t=optional fast-track (confirm current position as 'good')  "
+          "a=toggle auto-exposure  i/k/o/l/g/h=manual exposure/brightness/gain  "
+          "c=optional distance readout  r=reset stability")
 
     while True:
-        ok, frame = cap.read()
+        ok, raw_frame = cap.read()
         if not ok:
             print("Frame grab failed, retrying...")
             time.sleep(0.1)
             continue
 
-        frame = auto_gamma_correct(frame)
+        raw_gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+        exposure_ctrl.maybe_adjust(cap, raw_gray)  # continuous software auto-exposure
+
+        frame = auto_gamma_correct(raw_frame)
         display = frame.copy()
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Motion estimate between consecutive frames (for "hold steady")
-        if prev_gray_full is not None:
-            motion = float(np.mean(cv2.absdiff(gray_full, prev_gray_full)))
+        leaf_mask, bbox, area_ratio = detect_leaf(frame, cfg)
+        leaf_found = bbox is not None
+
+        # Motion estimate for "hold steady" - restricted to the leaf's own
+        # bounding box, and brightness-normalized (mean subtracted from
+        # each side) before comparing. This matters because the
+        # auto-exposure controller changes overall frame brightness while
+        # it converges - without normalizing, that brightness shift alone
+        # would read as "motion" and repeatedly reset the steady-frame
+        # counter even though the leaf never moved.
+        if leaf_found and prev_gray_full is not None:
+            x, y, w, h = bbox
+            x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
+            cur_roi_m = gray_full[y:y2, x:x2]
+            prev_roi_m = prev_gray_full[y:y2, x:x2]
+            if cur_roi_m.shape == prev_roi_m.shape and cur_roi_m.size > 0:
+                cur_norm = cur_roi_m.astype(np.float32) - float(np.mean(cur_roi_m))
+                prev_norm = prev_roi_m.astype(np.float32) - float(np.mean(prev_roi_m))
+                motion = float(np.mean(np.abs(cur_norm - prev_norm)))
+            else:
+                motion = 999.0
         else:
             motion = 999.0
         prev_gray_full = gray_full
-
-        leaf_mask, bbox, area_ratio = detect_leaf(frame, cfg)
-        leaf_found = bbox is not None
 
         brightness = sharpness = vein_score = 0.0
         roi_mask = None
@@ -479,8 +646,21 @@ def main():
 
             cv2.rectangle(display, (x, y), (x2, y2), (60, 200, 60), 2)
 
+            # Feed the adaptive learner - only from frames where the leaf is
+            # a plausible size and reasonably lit, so a stray bad frame
+            # doesn't skew what "good" means. Not while in tuning fast-track
+            # (that has its own short focused burst below).
+            if (not tuning_mode and cfg.min_area_ratio <= area_ratio <= cfg.max_area_ratio
+                    and cfg.min_brightness <= brightness <= cfg.max_brightness):
+                adaptive.update(sharpness, vein_score, motion)
+
+        sharp_thresh = adaptive.sharp_target(cfg.sharpness_threshold)
+        vein_thresh = adaptive.vein_target(cfg.vein_score_threshold)
+        live_motion_threshold = adaptive.motion_target(cfg.motion_threshold)
+
         guidance_text, all_pass = decide_guidance(
-            cfg, area_ratio, brightness, sharpness, vein_score, leaf_found)
+            cfg, area_ratio, brightness, sharpness, vein_score, leaf_found,
+            sharp_thresh, vein_thresh)
 
         score = quality_score(cfg, area_ratio, brightness, sharpness, vein_score) if leaf_found else 0.0
         if score > best_score:
@@ -489,18 +669,18 @@ def main():
         # Distance display: use calibrated estimate if available
         dist_estimate = calibrator.estimate(area_ratio) if leaf_found else None
 
-        # ---- auto-tune sample collection ----
+        # ---- optional fast-track sample collection ----
         if tuning_mode:
             if leaf_found:
-                tuning_samples.append((area_ratio, brightness, sharpness, vein_score))
+                tuning_samples.append((area_ratio, brightness, sharpness, vein_score, motion))
             if time.time() - tuning_start >= TUNING_DURATION_SEC:
                 tuning_mode = False
-                finish_autotune(cfg, tuning_samples)
+                finish_autotune(cfg, adaptive, tuning_samples)
                 tuning_samples = []
                 stability_hist.clear()
 
         # Stability tracking for autocapture (skip while tuning)
-        steady_now = all_pass and motion < cfg.motion_threshold
+        steady_now = all_pass and motion < live_motion_threshold
         stability_hist.append(steady_now)
         is_stable = (not tuning_mode and len(stability_hist) == stability_hist.maxlen
                      and all(stability_hist))
@@ -512,13 +692,22 @@ def main():
             session_captured = True
             stability_hist.clear()
 
+        if not tuning_mode and (now - last_status_print) > 1.0:
+            ready_str = "learned" if adaptive.ready else f"learning ({len(adaptive.sharp_samples)}/{adaptive.min_samples})"
+            print(f"[status] guidance='{guidance_text}'  motion={motion:.2f}/{live_motion_threshold:.2f}  "
+                  f"steady={len(stability_hist)}/{stability_hist.maxlen}  score={score:.1f}  "
+                  f"adaptive_targets={ready_str}")
+            last_status_print = now
+
         # ---- overlay ----
         if tuning_mode:
             draw_tuning_overlay(display, leaf_found, len(tuning_samples))
         else:
             draw_overlay(display, guidance_text, area_ratio, brightness, sharpness,
                          vein_score, score, dist_estimate, calibrator.is_calibrated,
-                         leaf_found)
+                         leaf_found, motion, live_motion_threshold,
+                         len(stability_hist), stability_hist.maxlen,
+                         exposure_ctrl.last_status)
 
         cv2.imshow("Leaf Capture System", display)
         key = cv2.waitKey(1) & 0xFF
@@ -541,13 +730,27 @@ def main():
             else:
                 print("[auto-tune] place a leaf in frame first, then press t.")
         elif key == ord('i'):
+            exposure_ctrl.enabled = False
             nudge_camera_property(cap, cv2.CAP_PROP_EXPOSURE, +1, "exposure +")
         elif key == ord('k'):
+            exposure_ctrl.enabled = False
             nudge_camera_property(cap, cv2.CAP_PROP_EXPOSURE, -1, "exposure -")
         elif key == ord('o'):
+            exposure_ctrl.enabled = False
             nudge_camera_property(cap, cv2.CAP_PROP_BRIGHTNESS, +10, "brightness +")
         elif key == ord('l'):
+            exposure_ctrl.enabled = False
             nudge_camera_property(cap, cv2.CAP_PROP_BRIGHTNESS, -10, "brightness -")
+        elif key == ord('g'):
+            exposure_ctrl.enabled = False
+            nudge_camera_property(cap, cv2.CAP_PROP_GAIN, +10, "gain +")
+        elif key == ord('h'):
+            exposure_ctrl.enabled = False
+            nudge_camera_property(cap, cv2.CAP_PROP_GAIN, -10, "gain -")
+        elif key == ord('a'):
+            exposure_ctrl.enabled = not exposure_ctrl.enabled
+            state = "ENABLED (automatic)" if exposure_ctrl.enabled else "PAUSED (manual)"
+            print(f"  [auto-exposure] {state}")
 
     cap.release()
     cv2.destroyAllWindows()
@@ -586,17 +789,18 @@ def save_autotune(cfg: Config, path: str = "autotune.json"):
         "optimal_area_high": cfg.optimal_area_high,
         "min_brightness": cfg.min_brightness,
         "max_brightness": cfg.max_brightness,
+        "motion_threshold": cfg.motion_threshold,
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
 
-def finish_autotune(cfg: Config, samples):
-    """Turn ~1.5s of live measurements from a leaf the user judged to look
-    good into concrete thresholds, then persist them so future runs start
-    already configured. Thresholds are set as a margin below/around the
-    observed values so minor natural variation (breathing, tiny shifts)
-    doesn't constantly fall below "good enough"."""
+def finish_autotune(cfg: Config, adaptive: AdaptiveThresholds, samples):
+    """Optional fast-track: take ~1.5s of live measurements from a leaf you
+    confirmed looks good, and inject them into the adaptive learner so it
+    is immediately 'ready' with a sensible target instead of waiting to
+    discover one organically. This is a shortcut, not a requirement - the
+    system learns the same targets on its own from normal use either way."""
     if len(samples) < 5:
         print("[auto-tune] not enough clean samples (leaf kept dropping out "
               "of detection) - try again, holding it steadier.")
@@ -606,25 +810,25 @@ def finish_autotune(cfg: Config, samples):
     brights = np.array([s[1] for s in samples])
     sharps = np.array([s[2] for s in samples])
     veins = np.array([s[3] for s in samples])
+    motions = np.array([s[4] for s in samples])
 
     med_area, med_bright = float(np.median(areas)), float(np.median(brights))
-    med_sharp, med_vein = float(np.median(sharps)), float(np.median(veins))
+    med_sharp, med_vein, med_motion = float(np.median(sharps)), float(np.median(veins)), float(np.median(motions))
 
-    cfg.sharpness_threshold = round(med_sharp * 0.7, 1)
-    cfg.vein_score_threshold = round(med_vein * 0.7, 1)
-
+    # Widen the plausible area/brightness range around this example a bit -
+    # convenience only, not required for sharpness/vein/motion learning.
     cfg.optimal_area_low = round(max(med_area * 0.7, 0.005), 4)
     cfg.optimal_area_high = round(min(med_area * 1.3, 0.9), 4)
     cfg.min_area_ratio = round(max(cfg.optimal_area_low * 0.6, 0.003), 4)
     cfg.max_area_ratio = round(min(cfg.optimal_area_high * 1.4, 0.9), 4)
-
     cfg.min_brightness = round(max(med_bright - 45, 20), 1)
     cfg.max_brightness = round(min(med_bright + 45, 250), 1)
 
-    save_autotune(cfg)
-    print(f"[auto-tune] done - thresholds set from {len(samples)} samples and "
-          f"saved to autotune.json. The system is now configured for this "
-          f"setup; place a leaf and it will guide/capture automatically.")
+    adaptive.seed(med_sharp, med_vein, med_motion, repeats=max(adaptive.min_samples + 5, 25))
+
+    print(f"[fast-track] confirmed example applied from {len(samples)} samples - "
+          f"adaptive targets are ready now instead of needing to be discovered "
+          f"organically. The system will keep refining from here as you use it.")
 
 
 def draw_tuning_overlay(img, leaf_found, sample_count):
@@ -632,7 +836,7 @@ def draw_tuning_overlay(img, leaf_found, sample_count):
     overlay = img.copy()
     cv2.rectangle(overlay, (0, 0), (w, 90), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
-    msg = "AUTO-TUNING - hold leaf steady..." if leaf_found else "AUTO-TUNING - leaf lost, repositioning..."
+    msg = "CONFIRMING POSITION - hold leaf steady..." if leaf_found else "CONFIRMING POSITION - leaf lost, repositioning..."
     color = (60, 200, 60) if leaf_found else (60, 60, 220)
     cv2.putText(img, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
     cv2.putText(img, f"samples collected: {sample_count}", (20, 75),
@@ -661,9 +865,10 @@ def save_frame(frame, cfg: Config, score: float, manual: bool = False):
 
 
 def draw_overlay(img, guidance_text, area_ratio, brightness, sharpness,
-                  vein_score, score, dist_estimate, is_calibrated, leaf_found):
+                  vein_score, score, dist_estimate, is_calibrated, leaf_found,
+                  motion, motion_threshold, stable_count, stable_needed, exposure_status):
     h, w = img.shape[:2]
-    panel_h = 150
+    panel_h = 180
     overlay = img.copy()
     cv2.rectangle(overlay, (0, 0), (w, panel_h), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
@@ -675,14 +880,19 @@ def draw_overlay(img, guidance_text, area_ratio, brightness, sharpness,
     cv2.putText(img, guidance_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
 
     dist_str = f"{dist_estimate:.2f} m" if dist_estimate is not None else "not calibrated"
+    motion_ok = motion < motion_threshold
+    motion_color = (60, 200, 60) if motion_ok else (60, 60, 220)
     lines = [
-        f"Leaf area ratio: {area_ratio:.3f}   Est. distance: {dist_str}",
-        f"Brightness: {brightness:.0f}   Sharpness: {sharpness:.0f}   Vein score: {vein_score:.1f}",
-        f"Quality score: {score:.1f}/100" + ("" if is_calibrated else "   [press 'c' to calibrate distance]"),
+        (f"Leaf area ratio: {area_ratio:.3f}   Est. distance: {dist_str}", (230, 230, 230)),
+        (f"Brightness: {brightness:.0f}   Sharpness: {sharpness:.0f}   Vein score: {vein_score:.1f}", (230, 230, 230)),
+        (f"Quality score: {score:.1f}/100" + ("" if is_calibrated else "   [press 'c' for distance, optional]"), (230, 230, 230)),
+        (f"Motion: {motion:.1f} / {motion_threshold:.1f} (need below)   "
+         f"Steady frames: {stable_count}/{stable_needed}", motion_color),
+        (exposure_status, (180, 180, 180)),
     ]
-    for i, line in enumerate(lines):
-        cv2.putText(img, line, (20, 75 + i * 26), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, (230, 230, 230), 1)
+    for i, (line, col) in enumerate(lines):
+        cv2.putText(img, line, (20, 75 + i * 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52, col, 1)
 
 
 if __name__ == "__main__":
