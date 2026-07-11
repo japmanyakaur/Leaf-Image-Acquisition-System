@@ -415,6 +415,7 @@ def auto_gamma_correct(bgr, target_mean=140.0):
 
 def main():
     cfg = Config()
+    load_autotune(cfg)
     os.makedirs(cfg.output_dir, exist_ok=True)
     calibrator = DistanceCalibrator(cfg.calibration_file)
 
@@ -434,8 +435,13 @@ def main():
     best_frame, best_score = None, -1.0
     session_captured = False
 
-    print("Ready. Controls: q=quit  s=manual save  c=calibrate  r=reset stability  "
-          "i/k=exposure +/-  o/l=brightness +/-")
+    tuning_mode = False
+    tuning_samples = []
+    tuning_start = 0.0
+    TUNING_DURATION_SEC = 1.5
+
+    print("Ready. Controls: q=quit  s=manual save  t=AUTO-TUNE (do this first!)  "
+          "c=calibrate distance (optional)  r=reset stability  i/k=exposure +/-  o/l=brightness +/-")
 
     while True:
         ok, frame = cap.read()
@@ -483,10 +489,21 @@ def main():
         # Distance display: use calibrated estimate if available
         dist_estimate = calibrator.estimate(area_ratio) if leaf_found else None
 
-        # Stability tracking for autocapture
+        # ---- auto-tune sample collection ----
+        if tuning_mode:
+            if leaf_found:
+                tuning_samples.append((area_ratio, brightness, sharpness, vein_score))
+            if time.time() - tuning_start >= TUNING_DURATION_SEC:
+                tuning_mode = False
+                finish_autotune(cfg, tuning_samples)
+                tuning_samples = []
+                stability_hist.clear()
+
+        # Stability tracking for autocapture (skip while tuning)
         steady_now = all_pass and motion < cfg.motion_threshold
         stability_hist.append(steady_now)
-        is_stable = len(stability_hist) == stability_hist.maxlen and all(stability_hist)
+        is_stable = (not tuning_mode and len(stability_hist) == stability_hist.maxlen
+                     and all(stability_hist))
 
         now = time.time()
         if is_stable and (now - last_capture_time) > cfg.capture_cooldown_sec:
@@ -496,9 +513,12 @@ def main():
             stability_hist.clear()
 
         # ---- overlay ----
-        draw_overlay(display, guidance_text, area_ratio, brightness, sharpness,
-                     vein_score, score, dist_estimate, calibrator.is_calibrated,
-                     leaf_found)
+        if tuning_mode:
+            draw_tuning_overlay(display, leaf_found, len(tuning_samples))
+        else:
+            draw_overlay(display, guidance_text, area_ratio, brightness, sharpness,
+                         vein_score, score, dist_estimate, calibrator.is_calibrated,
+                         leaf_found)
 
         cv2.imshow("Leaf Capture System", display)
         key = cv2.waitKey(1) & 0xFF
@@ -512,6 +532,14 @@ def main():
             stability_hist.clear()
         elif key == ord('c'):
             handle_calibration(calibrator, area_ratio)
+        elif key == ord('t'):
+            if leaf_found:
+                tuning_mode = True
+                tuning_samples = []
+                tuning_start = time.time()
+                print("[auto-tune] hold the leaf steady in its best position...")
+            else:
+                print("[auto-tune] place a leaf in frame first, then press t.")
         elif key == ord('i'):
             nudge_camera_property(cap, cv2.CAP_PROP_EXPOSURE, +1, "exposure +")
         elif key == ord('k'):
@@ -529,6 +557,86 @@ def main():
                       f"(score {best_score:.1f}) now? [y/N]: ").strip().lower()
         if resp == "y":
             save_frame(best_frame, cfg, best_score, manual=True)
+
+
+def load_autotune(cfg: Config, path: str = "autotune.json"):
+    """If a previous auto-tune run saved thresholds, load them over the
+    Config defaults so the system starts already configured for your
+    webcam/room/leaf setup."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        for key, value in data.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+        print(f"Loaded auto-tuned thresholds from {path}.")
+    except (json.JSONDecodeError, OSError):
+        print(f"Could not read {path}, using default thresholds.")
+
+
+def save_autotune(cfg: Config, path: str = "autotune.json"):
+    data = {
+        "sharpness_threshold": cfg.sharpness_threshold,
+        "vein_score_threshold": cfg.vein_score_threshold,
+        "min_area_ratio": cfg.min_area_ratio,
+        "max_area_ratio": cfg.max_area_ratio,
+        "optimal_area_low": cfg.optimal_area_low,
+        "optimal_area_high": cfg.optimal_area_high,
+        "min_brightness": cfg.min_brightness,
+        "max_brightness": cfg.max_brightness,
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def finish_autotune(cfg: Config, samples):
+    """Turn ~1.5s of live measurements from a leaf the user judged to look
+    good into concrete thresholds, then persist them so future runs start
+    already configured. Thresholds are set as a margin below/around the
+    observed values so minor natural variation (breathing, tiny shifts)
+    doesn't constantly fall below "good enough"."""
+    if len(samples) < 5:
+        print("[auto-tune] not enough clean samples (leaf kept dropping out "
+              "of detection) - try again, holding it steadier.")
+        return
+
+    areas = np.array([s[0] for s in samples])
+    brights = np.array([s[1] for s in samples])
+    sharps = np.array([s[2] for s in samples])
+    veins = np.array([s[3] for s in samples])
+
+    med_area, med_bright = float(np.median(areas)), float(np.median(brights))
+    med_sharp, med_vein = float(np.median(sharps)), float(np.median(veins))
+
+    cfg.sharpness_threshold = round(med_sharp * 0.7, 1)
+    cfg.vein_score_threshold = round(med_vein * 0.7, 1)
+
+    cfg.optimal_area_low = round(max(med_area * 0.7, 0.005), 4)
+    cfg.optimal_area_high = round(min(med_area * 1.3, 0.9), 4)
+    cfg.min_area_ratio = round(max(cfg.optimal_area_low * 0.6, 0.003), 4)
+    cfg.max_area_ratio = round(min(cfg.optimal_area_high * 1.4, 0.9), 4)
+
+    cfg.min_brightness = round(max(med_bright - 45, 20), 1)
+    cfg.max_brightness = round(min(med_bright + 45, 250), 1)
+
+    save_autotune(cfg)
+    print(f"[auto-tune] done - thresholds set from {len(samples)} samples and "
+          f"saved to autotune.json. The system is now configured for this "
+          f"setup; place a leaf and it will guide/capture automatically.")
+
+
+def draw_tuning_overlay(img, leaf_found, sample_count):
+    h, w = img.shape[:2]
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 90), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
+    msg = "AUTO-TUNING - hold leaf steady..." if leaf_found else "AUTO-TUNING - leaf lost, repositioning..."
+    color = (60, 200, 60) if leaf_found else (60, 60, 220)
+    cv2.putText(img, msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+    cv2.putText(img, f"samples collected: {sample_count}", (20, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1)
 
 
 def handle_calibration(calibrator: DistanceCalibrator, area_ratio: float):
