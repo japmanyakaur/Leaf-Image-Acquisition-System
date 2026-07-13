@@ -146,13 +146,53 @@ def excess_green_mask(frame):
     ExG value is low/negative and gets thresholded away, whereas an
     actual leaf's green channel dominates and its ExG is clearly
     positive. This is now the primary detector; the HSV hue mask below
-    is only a secondary check."""
+    is only a secondary check.
+
+    THRESHOLD BUG FIX: a plain global Otsu threshold on the ExG image
+    picks whichever cutoff best separates the single MOST vividly-green
+    region (e.g. a saturated green mesh/grille in the background) from
+    everything else. If the real leaf is paler / less saturated than
+    that other object, Otsu's cutoff lands ABOVE the leaf's ExG values -
+    the leaf doesn't get merged with the background, it simply never
+    becomes a foreground pixel at all, so it can never become a candidate
+    contour downstream. To guard against that we cap the threshold at a
+    fixed, more inclusive ceiling whenever Otsu would have picked
+    something higher - this keeps paler green objects in the mask too,
+    at the cost of possibly including some background as well. That's an
+    acceptable trade because _best_valid_contour (below) then screens
+    candidates on shape, solidity, AND color plausibility rather than
+    blindly taking the largest blob."""
     b, g, r = cv2.split(frame.astype(np.float32))
     exg = 2.0 * g - r - b
     exg_u8 = np.clip(exg, 0, 255).astype(np.uint8)
     exg_blur = cv2.GaussianBlur(exg_u8, (5, 5), 0)
-    _, mask = cv2.threshold(exg_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu_val, _ = cv2.threshold(exg_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    inclusive_thresh = min(otsu_val, 20.0)
+    _, mask = cv2.threshold(exg_blur, inclusive_thresh, 255, cv2.THRESH_BINARY)
     return mask
+
+
+def gray_world_white_balance(frame):
+    """Corrects a global color cast (e.g. the cyan/teal tint seen from
+    this webcam under mixed lighting, where white paper reads pale cyan
+    instead of white) by scaling each channel so their means roughly
+    match - the standard gray-world assumption. Run this FIRST, before
+    anything ExG/HSV-based: an uncorrected cast pushes a neutral
+    background toward "false green" and can mute or exaggerate the
+    leaf's true greenness, which was quietly feeding both the mask and
+    the color-plausibility check. Gains are clamped so a scene that is
+    genuinely green overall doesn't get corrected away."""
+    b, g, r = cv2.split(frame.astype(np.float32))
+    mean_b, mean_g, mean_r = float(np.mean(b)), float(np.mean(g)), float(np.mean(r))
+    mean_gray = (mean_b + mean_g + mean_r) / 3.0
+    eps = 1e-3
+    scale_b = np.clip(mean_gray / max(mean_b, eps), 0.6, 1.6)
+    scale_g = np.clip(mean_gray / max(mean_g, eps), 0.6, 1.6)
+    scale_r = np.clip(mean_gray / max(mean_r, eps), 0.6, 1.6)
+    b = np.clip(b * scale_b, 0, 255)
+    g = np.clip(g * scale_g, 0, 255)
+    r = np.clip(r * scale_r, 0, 255)
+    return cv2.merge((b, g, r)).astype(np.uint8)
 
 
 def _mean_bgr_in_mask(frame, mask):
@@ -184,7 +224,18 @@ def background_diff_mask(frame, bg_color):
     return mask
 
 
-def _largest_valid_contour(mask, frame_area, max_ratio=0.75, min_ratio=0.003, min_solidity=0.0):
+def _largest_valid_contour(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, min_solidity=0.0):
+    """Picks the best candidate contour, NOT simply the largest.
+
+    Why: once excess_green_mask() was made more inclusive (see fix above),
+    a small but very saturated background object (e.g. a green mesh)
+    and a large but paler leaf can BOTH show up as separate contours in
+    the same mask. Every candidate is scored on a combination of (a) how
+    much of the frame it covers and (b) how clearly green-dominant its
+    average color is (green minus red/blue). A candidate that isn't
+    green-dominant at all is discarded outright, regardless of size - so
+    a compact, highly-saturated patch can no longer beat out a bigger,
+    correctly-toned leaf just by being "greener"."""
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -193,24 +244,44 @@ def _largest_valid_contour(mask, frame_area, max_ratio=0.75, min_ratio=0.003, mi
     if not contours:
         return None, None, 0.0
 
-    largest = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(largest)
-    area_ratio = area / frame_area
+    best_mask, best_bbox, best_area_ratio, best_score = None, None, 0.0, -1.0
 
-    if area_ratio < min_ratio or area_ratio > max_ratio:
+    for c in contours:
+        area = cv2.contourArea(c)
+        area_ratio = area / frame_area
+        if area_ratio < min_ratio or area_ratio > max_ratio:
+            continue
+
+        if min_solidity > 0:
+            hull = cv2.convexHull(c)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 1e-6 else 0.0
+            if solidity < min_solidity:
+                continue
+
+        candidate_mask = np.zeros(mask.shape, dtype=np.uint8)
+        cv2.drawContours(candidate_mask, [c], -1, 255, thickness=cv2.FILLED)
+
+        means = _mean_bgr_in_mask(frame, candidate_mask)
+        if means is None:
+            continue
+        cb, cg, cr = means
+        color_margin = min(cg - cr, cg - cb)
+        if color_margin <= 3.0:
+            continue  # not actually green-dominant - never let this win on size alone
+
+        score = area_ratio * (1.0 + min(color_margin, 60.0) / 60.0)
+        if score > best_score:
+            best_score = score
+            best_area_ratio = area_ratio
+            x, y, w, h = cv2.boundingRect(c)
+            best_bbox = (x, y, w, h)
+            best_mask = candidate_mask
+
+    if best_mask is None:
         return None, None, 0.0
 
-    if min_solidity > 0:
-        hull = cv2.convexHull(largest)
-        hull_area = cv2.contourArea(hull)
-        solidity = area / hull_area if hull_area > 1e-6 else 0.0
-        if solidity < min_solidity:
-            return None, None, 0.0
-
-    leaf_mask = np.zeros(mask.shape, dtype=np.uint8)
-    cv2.drawContours(leaf_mask, [largest], -1, 255, thickness=cv2.FILLED)
-    x, y, w, h = cv2.boundingRect(largest)
-    return leaf_mask, (x, y, w, h), area_ratio
+    return best_mask, best_bbox, best_area_ratio
 
 
 def detect_leaf(frame, cfg: Config):
@@ -232,25 +303,25 @@ def detect_leaf(frame, cfg: Config):
     frame_area = frame.shape[0] * frame.shape[1]
 
     exg_mask = excess_green_mask(frame)
-    exg_result = _largest_valid_contour(exg_mask, frame_area, max_ratio=0.75,
+    exg_result = _largest_valid_contour(frame, exg_mask, frame_area, max_ratio=0.75,
                                          min_ratio=0.003, min_solidity=0.30)
-    if exg_result[1] is not None and _is_plausible_leaf_color(frame, exg_result[0]):
+    if exg_result[1] is not None:
         return exg_result[0], exg_result[1], exg_result[2]
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower = np.array(cfg.hsv_lower, dtype=np.uint8)
     upper = np.array(cfg.hsv_upper, dtype=np.uint8)
     hue_mask = cv2.inRange(hsv, lower, upper)
-    hue_result = _largest_valid_contour(hue_mask, frame_area, max_ratio=0.75,
+    hue_result = _largest_valid_contour(frame, hue_mask, frame_area, max_ratio=0.75,
                                          min_ratio=0.003, min_solidity=0.30)
-    if hue_result[1] is not None and _is_plausible_leaf_color(frame, hue_result[0]):
+    if hue_result[1] is not None:
         return hue_result[0], hue_result[1], hue_result[2]
 
     bg_color = estimate_background_color(frame)
     bg_mask = background_diff_mask(frame, bg_color)
-    bg_result = _largest_valid_contour(bg_mask, frame_area, max_ratio=0.5,
+    bg_result = _largest_valid_contour(frame, bg_mask, frame_area, max_ratio=0.5,
                                         min_ratio=0.003, min_solidity=0.35)
-    if bg_result[1] is not None and _is_plausible_leaf_color(frame, bg_result[0]):
+    if bg_result[1] is not None:
         return bg_result[0], bg_result[1], bg_result[2]
 
     # Nothing passed validation - still hand back the combined raw masks
@@ -941,6 +1012,10 @@ def main():
         # exposure sampling, gamma correction, cropping on save) operates on
         # the already-zoomed frame and stays geometrically consistent.
         raw_frame = apply_digital_zoom(raw_frame_full, cfg.zoom_factor)
+        # Correct any global color cast (e.g. cyan/teal tint) before the
+        # frame is used for anything else - detection, exposure sampling,
+        # and gamma correction all assume roughly neutral color.
+        raw_frame = gray_world_white_balance(raw_frame)
 
         raw_gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
         frame = auto_gamma_correct(raw_frame)
