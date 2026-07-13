@@ -1,8 +1,7 @@
 """
 Intelligent Vision-Based Leaf Image Acquisition System
 --------------------------------------------------------
-Runs on a fixed-focus webcam (e.g. Lenovo 300 FHD). Two things happen, and
-that's the whole system:
+Runs on a fixed-focus webcam (e.g. Lenovo 300 FHD).
 
 1. FULLY AUTOMATIC by default - exposure, brightness, and sensor gain are
    continuously adjusted by the system itself, in any environment (indoor
@@ -10,30 +9,50 @@ that's the whole system:
    Exposure is driven off the LEAF's own brightness (not the background),
    so a bright or dark background can't push the leaf itself over- or
    under-exposed. Sharpness/vein "good enough" targets are learned live
-   from what the camera actually sees as you move the leaf around (this
-   lens is fixed-focus, so there is a real, physical sharp distance you
-   have to find - no software removes that - but the system finds it
-   statistically on its own instead of you having to judge and confirm it).
+   from what the camera actually sees as you move the leaf around.
 
-2. MANUAL OVERRIDE (secondary) - four keys let you directly nudge exposure
-   and brightness if you ever want to. Using them pauses automatic
-   adjustment temporarily; it resumes on its own after a short idle period.
+2. MANUAL OVERRIDE (secondary) - available two ways now:
+     a) Keys i/k (exposure +/-) and o/l (brightness +/-) - a quick nudge
+        that pauses automatic adjustment temporarily; it resumes on its
+        own after a short idle period, exactly as before.
+     b) A "Controls" side panel (a second window docked next to the
+        preview) with sliders for Exposure, Brightness and Zoom, plus an
+        "Auto Mode" toggle. Flipping the toggle to Manual (0) is a
+        *persistent* lock - the sliders take direct control and it will
+        NOT silently resume automatic like the key-nudges do. Flip it
+        back to Auto (1) to hand control back to the automatic loop.
 
-You'll see a green "CAPTURED" flash on screen and a running counter
-whenever a frame is saved, so you don't have to watch the console.
+You'll see a bounding box drawn around the detected leaf on every frame
+it is found, a green "CAPTURED" flash on screen, and a running counter
+whenever a frame is saved.
+
+Press 'm' to toggle a small debug inset showing the raw detection mask -
+useful if the bounding box ever seems to disappear, since it shows
+exactly what the detector is (or isn't) seeing.
 
 USAGE
     python leaf_capture_system.py
 
-CONTROLS (while the preview window is focused)
+CONTROLS (while a window is focused)
     q      - quit
     s      - force-save the current frame right now
-    i / k  - manually raise / lower exposure
-    o / l  - manually raise / lower brightness
+    i / k  - manually raise / lower exposure  (temporary override)
+    o / l  - manually raise / lower brightness (temporary override)
+    m      - toggle debug mask inset (helps diagnose "no bounding box")
+    Controls window sliders:
+        Exposure       - direct exposure control (only takes effect
+                          while Auto Mode = 0)
+        Brightness     - direct brightness control (only takes effect
+                          while Auto Mode = 0)
+        Zoom           - digital zoom, 100 = 1.0x ... 300 = 3.0x
+        Auto Mode      - 1 = automatic exposure (default), 0 = manual
+                          (locks control to the Exposure/Brightness
+                          sliders until switched back to 1)
 
 OUTPUT
     Captured frames go to ./captures/leaf_YYYYMMDD_HHMMSS_<tag>_scoreXXX.jpg
-    Saved frames are cropped tightly around the detected leaf.
+    Saved frames are cropped tightly around the detected leaf ONLY - the
+    rest of the frame is discarded before writing to disk.
     tag = auto (normal capture), manual (you pressed 's'), or
     timeout (guarantee-save fired before a fully sharp frame was seen -
     check these, they may be soft).
@@ -60,7 +79,7 @@ class Config:
     output_dir: str = "captures"
 
     # --- Leaf size relative to frame (area_ratio = leaf_area / frame_area) ---
-    min_area_ratio: float = 0.03     # below this -> leaf reads as "too far"
+    min_area_ratio: float = 0.02     # below this -> leaf reads as "too far"
     max_area_ratio: float = 0.55     # above this -> leaf reads as "too close"
 
     # --- Brightness (mean of grayscale, 0-255), measured over the leaf ---
@@ -79,14 +98,27 @@ class Config:
     capture_cooldown_sec: float = 3.0
     capture_timeout_sec: float = 9.0      # guarantee: save best-seen shot if "perfect" never hits this long
 
-    # --- HSV range for green leaf segmentation (broad, override if needed) ---
-    hsv_lower: tuple = (20, 25, 25)
+    # --- HSV range for green leaf segmentation. Kept fairly narrow to
+    # TRUE greens on purpose: hue values below ~25 overlap skin tone, so a
+    # wide lower bound causes the detector to lock onto a hand/arm holding
+    # the leaf instead of the leaf itself. This is now only a secondary
+    # check (see detect_leaf) - the primary segmentation is excess-green,
+    # which doesn't depend on a hand-tuned hue cutoff at all. ---
+    hsv_lower: tuple = (28, 30, 25)
     hsv_upper: tuple = (95, 255, 255)
 
     # --- Output framing / feedback ---
     crop_margin: float = 0.12          # tight crop around the leaf when saving (fraction of bbox size)
     capture_flash_sec: float = 1.8     # how long the on-screen "CAPTURED" flash stays visible
     low_confidence_score: float = 55.0 # below this, a timeout-save is flagged as possibly soft
+
+    # --- Digital zoom (applied before detection, so bbox/crop stay consistent) ---
+    zoom_factor: float = 1.0
+    zoom_min: float = 1.0
+    zoom_max: float = 3.0
+
+    # --- Debug ---
+    show_debug_mask: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +136,44 @@ def estimate_background_color(frame, margin=50):
     ]
     samples = np.vstack([p.reshape(-1, 3) for p in patches])
     return np.median(samples, axis=0)
+
+
+def excess_green_mask(frame):
+    """Excess Green Index: ExG = 2G - R - B, per pixel. This is the
+    standard robust way to segment live green vegetation regardless of
+    background, and - critically - it does NOT mistake a hand/arm for
+    the leaf the way a hue-range threshold can: skin has R >= G, so its
+    ExG value is low/negative and gets thresholded away, whereas an
+    actual leaf's green channel dominates and its ExG is clearly
+    positive. This is now the primary detector; the HSV hue mask below
+    is only a secondary check."""
+    b, g, r = cv2.split(frame.astype(np.float32))
+    exg = 2.0 * g - r - b
+    exg_u8 = np.clip(exg, 0, 255).astype(np.uint8)
+    exg_blur = cv2.GaussianBlur(exg_u8, (5, 5), 0)
+    _, mask = cv2.threshold(exg_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return mask
+
+
+def _mean_bgr_in_mask(frame, mask):
+    if mask is None or not np.any(mask):
+        return None
+    pixels = frame[mask > 0].astype(np.float32)
+    b, g, r = pixels[:, 0].mean(), pixels[:, 1].mean(), pixels[:, 2].mean()
+    return b, g, r
+
+
+def _is_plausible_leaf_color(frame, mask, margin=3.0):
+    """Sanity check applied to WHATEVER contour a detector picked: the
+    average color inside it must actually be green-dominant (G clearly
+    above both R and B). This is what stops a skin-toned hand, wood grain,
+    or a brownish background from ever being accepted as 'the leaf', even
+    if it happened to pass the shape/solidity checks."""
+    means = _mean_bgr_in_mask(frame, mask)
+    if means is None:
+        return False
+    b, g, r = means
+    return (g - r) > margin and (g - b) > margin
 
 
 def background_diff_mask(frame, bg_color):
@@ -144,32 +214,50 @@ def _largest_valid_contour(mask, frame_area, max_ratio=0.75, min_ratio=0.003, mi
 
 
 def detect_leaf(frame, cfg: Config):
-    """Leaf-color (green hue) detection is tried FIRST and used whenever it
-    finds anything plausible - it works on any background because it's
-    reasoning about the leaf's own color, not the scene behind it.
-    Background-difference detection is only a fallback for when color
-    detection finds nothing at all (e.g. a badly backlit leaf), and even
-    then requires a solid, compact shape so real-world clutter can't be
-    misread as one giant leaf."""
+    """Detection order, each gated by _is_plausible_leaf_color so a hand,
+    wall, or wood surface can never be accepted just because it happened
+    to pass a shape/solidity check:
+
+    1. Excess-green (ExG) segmentation - the primary detector. Robust to
+       background AND to skin tone, since it reasons about green-channel
+       dominance rather than a fixed hue window.
+    2. HSV true-green hue mask - secondary check, catches cases ExG
+       misses (e.g. very low-saturation lighting).
+    3. Background-difference - last resort for a badly backlit leaf,
+       still gated by the same color-plausibility check afterward.
+
+    Returns (mask_used_for_detection, bbox_or_None, area_ratio).
+    mask_used_for_detection is always returned (even on failure) so the
+    caller can show it in the debug inset."""
     frame_area = frame.shape[0] * frame.shape[1]
+
+    exg_mask = excess_green_mask(frame)
+    exg_result = _largest_valid_contour(exg_mask, frame_area, max_ratio=0.75,
+                                         min_ratio=0.003, min_solidity=0.30)
+    if exg_result[1] is not None and _is_plausible_leaf_color(frame, exg_result[0]):
+        return exg_result[0], exg_result[1], exg_result[2]
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower = np.array(cfg.hsv_lower, dtype=np.uint8)
     upper = np.array(cfg.hsv_upper, dtype=np.uint8)
     hue_mask = cv2.inRange(hsv, lower, upper)
     hue_result = _largest_valid_contour(hue_mask, frame_area, max_ratio=0.75,
-                                         min_ratio=0.003, min_solidity=0.35)
-    if hue_result[1] is not None:
-        return hue_result
+                                         min_ratio=0.003, min_solidity=0.30)
+    if hue_result[1] is not None and _is_plausible_leaf_color(frame, hue_result[0]):
+        return hue_result[0], hue_result[1], hue_result[2]
 
     bg_color = estimate_background_color(frame)
     bg_mask = background_diff_mask(frame, bg_color)
     bg_result = _largest_valid_contour(bg_mask, frame_area, max_ratio=0.5,
-                                        min_ratio=0.003, min_solidity=0.45)
-    if bg_result[1] is not None:
-        return bg_result
+                                        min_ratio=0.003, min_solidity=0.35)
+    if bg_result[1] is not None and _is_plausible_leaf_color(frame, bg_result[0]):
+        return bg_result[0], bg_result[1], bg_result[2]
 
-    return hue_mask, None, 0.0
+    # Nothing passed validation - still hand back the combined raw masks
+    # so the debug inset ('m' key) can show *why* nothing matched, instead
+    # of a blank screen.
+    combined = cv2.bitwise_or(exg_mask, cv2.bitwise_or(hue_mask, bg_mask))
+    return combined, None, 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -327,6 +415,22 @@ def quality_score(cfg: Config, area_ratio, brightness, sharpness, vein_score):
 
 
 # --------------------------------------------------------------------------- #
+# Digital zoom - applied before detection so the bbox/crop stay consistent
+# with everything downstream (nothing else needs to know zoom happened).
+# --------------------------------------------------------------------------- #
+
+def apply_digital_zoom(frame, zoom_factor):
+    if zoom_factor <= 1.001:
+        return frame
+    h, w = frame.shape[:2]
+    crop_w, crop_h = int(w / zoom_factor), int(h / zoom_factor)
+    x1 = (w - crop_w) // 2
+    y1 = (h - crop_h) // 2
+    cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+# --------------------------------------------------------------------------- #
 # Camera setup and automatic exposure control
 # --------------------------------------------------------------------------- #
 
@@ -365,9 +469,17 @@ class AutoExposureController:
     target - works the same indoors or outdoors, with zero setup. Uses
     exposure (shutter) as the primary lever, but switches to sensor GAIN
     once exposure is maxed out, since a longer shutter risks motion blur
-    (which would hurt sharpness) while gain doesn't. Manual i/k/o/l keys
-    pause this temporarily; it resumes automatically after a short idle
-    period so automatic stays the default without needing a toggle key.
+    (which would hurt sharpness) while gain doesn't.
+
+    Two ways to take manual control now:
+      - Temporary: the i/k/o/l keys call pause_for_manual_override(), which
+        pauses automatic adjustment and resumes it on its own after a
+        short idle period (unchanged from before).
+      - Persistent: the "Auto Mode" slider in the Controls window calls
+        enable_manual_lock()/disable_manual_lock(). While locked, this
+        controller does nothing at all and the Exposure/Brightness
+        sliders drive the camera directly - it will NOT auto-resume until
+        the toggle is flipped back.
 
     Two things that previously caused "too bright / randomly goes black":
     1. The camera's own FIRMWARE auto-exposure was never turned off, so it
@@ -397,6 +509,7 @@ class AutoExposureController:
         self.frame_count = 0
         self.paused = False
         self.resume_at = 0.0
+        self.manual_lock = False
         self.last_status = "warming up"
         self.baseline_exposure = None
         self.baseline_gain = None
@@ -437,10 +550,25 @@ class AutoExposureController:
             self.last_status = "reset to baseline (frame went black)"
 
     def pause_for_manual_override(self):
+        """Temporary pause used by the i/k/o/l keys - resumes on its own."""
         self.paused = True
         self.resume_at = time.time() + self.RESUME_AFTER_IDLE_SEC
 
+    def enable_manual_lock(self):
+        """Persistent lock used by the Controls window 'Auto Mode' toggle -
+        does NOT auto-resume; disable_manual_lock() must be called."""
+        self.manual_lock = True
+        self.last_status = "manual lock (Controls panel)"
+
+    def disable_manual_lock(self):
+        self.manual_lock = False
+
     def maybe_adjust(self, cap, mean_brightness: float):
+        if self.manual_lock:
+            # Fully hands-off: the Controls sliders are driving exposure/
+            # brightness directly elsewhere in the main loop.
+            return
+
         if self.paused:
             remaining = self.resume_at - time.time()
             if remaining <= 0:
@@ -540,7 +668,9 @@ def _beep():
 def save_frame(frame, cfg: Config, score: float, bbox=None, manual: bool = False,
                 low_confidence: bool = False):
     """Crops tightly to the detected leaf (plus a small margin) before
-    saving, instead of writing the whole 1080p frame."""
+    saving, instead of writing the whole 1080p frame. If bbox is None
+    (no leaf was ever detected, e.g. a forced 's' save with nothing in
+    frame) the full frame is saved as a fallback."""
     out = frame
     if bbox is not None:
         x, y, w, h = bbox
@@ -590,10 +720,33 @@ COL_DANGER = (70, 70, 225)
 COL_TEXT_PRIMARY = (240, 240, 240)
 COL_TEXT_MUTED = (160, 160, 160)
 COL_BAR_BG = (46, 46, 52)
+COL_BBOX = (0, 255, 60)
 
 
 def status_color(ok):
     return COL_SUCCESS if ok else COL_DANGER
+
+
+def draw_leaf_bbox(img, bbox):
+    """Draws a clearly visible bounding box (thick outline + corner
+    accents + label) around the detected leaf. Kept as its own function
+    so it always runs whenever bbox is not None, regardless of anything
+    else going on in the overlay."""
+    x, y, w, h = bbox
+    x2, y2 = x + w, y + h
+
+    cv2.rectangle(img, (x, y), (x2, y2), COL_BBOX, 3)
+
+    corner_len = max(min(w, h) // 6, 14)
+    for cx, cy, dx, dy in [(x, y, 1, 1), (x2, y, -1, 1), (x, y2, 1, -1), (x2, y2, -1, -1)]:
+        cv2.line(img, (cx, cy), (cx + dx * corner_len, cy), (255, 255, 255), 4)
+        cv2.line(img, (cx, cy), (cx, cy + dy * corner_len), (255, 255, 255), 4)
+
+    label = "LEAF"
+    (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    ly = y - 10 if y - 10 - lh > 0 else y2 + lh + 10
+    cv2.rectangle(img, (x, ly - lh - 6), (x + lw + 12, ly + 4), COL_BBOX, -1)
+    cv2.putText(img, label, (x + 6, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2, cv2.LINE_AA)
 
 
 def draw_overlay(img, guidance_text, score, leaf_found, stable_count, stable_needed,
@@ -653,6 +806,86 @@ def draw_overlay(img, guidance_text, score, leaf_found, stable_count, stable_nee
                     1.0, COL_SUCCESS, 3, cv2.LINE_AA)
 
 
+def draw_debug_mask_inset(display, mask, leaf_found):
+    """Small picture-in-picture of the raw detection mask, bottom-left
+    corner. Toggle with 'm'. White = what the detector thinks is leaf.
+    If the bounding box isn't appearing, this is the first place to look:
+    an empty/noisy mask means the color/background thresholds need
+    tuning for your lighting, not that the drawing code is broken."""
+    h, w = display.shape[:2]
+    inset_w, inset_h = 260, 150
+    mask_small = cv2.resize(mask, (inset_w, inset_h))
+    mask_bgr = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
+
+    x1, y1 = 16, h - inset_h - 16
+    x2, y2 = x1 + inset_w, y1 + inset_h
+    border_color = COL_SUCCESS if leaf_found else COL_DANGER
+    cv2.rectangle(display, (x1 - 3, y1 - 3), (x2 + 3, y2 + 3), border_color, 3)
+    display[y1:y2, x1:x2] = mask_bgr
+    cv2.putText(display, "detection mask ('m' to hide)", (x1, y1 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, COL_TEXT_PRIMARY, 1, cv2.LINE_AA)
+
+
+# --------------------------------------------------------------------------- #
+# Controls side panel - sliders for Exposure / Brightness / Zoom plus an
+# Auto/Manual toggle. This is a second OpenCV window docked next to the
+# preview (OpenCV trackbars must live in their own window - there's no
+# native way to embed a slider inside an image window), positioned so it
+# reads as a side panel rather than a separate, unrelated window.
+# --------------------------------------------------------------------------- #
+
+CONTROLS_WIN = "Controls"
+SLIDER_EXPOSURE = "Exposure"
+SLIDER_BRIGHTNESS = "Brightness"
+SLIDER_ZOOM = "Zoom (x100)"
+SLIDER_AUTO = "Auto(1)/Manual(0)"
+
+
+def create_controls_window(cfg: Config, main_window_name: str):
+    cv2.namedWindow(CONTROLS_WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(CONTROLS_WIN, 340, 220)
+    # Dock it to the left of the main preview window so it reads as a
+    # side panel rather than a floating, unrelated window.
+    cv2.moveWindow(main_window_name, 360, 30)
+    cv2.moveWindow(CONTROLS_WIN, 10, 30)
+
+    cv2.createTrackbar(SLIDER_EXPOSURE, CONTROLS_WIN, 100, 200, lambda v: None)
+    cv2.createTrackbar(SLIDER_BRIGHTNESS, CONTROLS_WIN, 100, 200, lambda v: None)
+    zoom_init = int(cfg.zoom_factor * 100)
+    cv2.createTrackbar(SLIDER_ZOOM, CONTROLS_WIN, zoom_init, int(cfg.zoom_max * 100), lambda v: None)
+    cv2.createTrackbar(SLIDER_AUTO, CONTROLS_WIN, 1, 1, lambda v: None)
+
+
+def read_controls(cap, cfg: Config, exposure_ctrl: AutoExposureController):
+    """Polls the Controls window sliders once per frame and applies them.
+    Exposure/Brightness sliders only actually move the camera while
+    Auto Mode is set to 0 (manual lock engaged) - otherwise the automatic
+    controller owns those properties and the sliders are inert (moving
+    them does nothing until you flip the toggle)."""
+    auto_val = cv2.getTrackbarPos(SLIDER_AUTO, CONTROLS_WIN)
+    if auto_val == 1 and exposure_ctrl.manual_lock:
+        exposure_ctrl.disable_manual_lock()
+    elif auto_val == 0 and not exposure_ctrl.manual_lock:
+        exposure_ctrl.enable_manual_lock()
+
+    if exposure_ctrl.manual_lock and exposure_ctrl.baseline_exposure is not None:
+        exp_slider = cv2.getTrackbarPos(SLIDER_EXPOSURE, CONTROLS_WIN)
+        bri_slider = cv2.getTrackbarPos(SLIDER_BRIGHTNESS, CONTROLS_WIN)
+
+        exp_lo = exposure_ctrl.baseline_exposure - exposure_ctrl.exposure_max_drift
+        exp_hi = exposure_ctrl.baseline_exposure + exposure_ctrl.exposure_max_drift
+        target_exp = exp_lo + (exp_slider / 200.0) * (exp_hi - exp_lo)
+        cap.set(cv2.CAP_PROP_EXPOSURE, target_exp)
+
+        bri_lo = exposure_ctrl.baseline_brightness - exposure_ctrl.brightness_max_drift
+        bri_hi = exposure_ctrl.baseline_brightness + exposure_ctrl.brightness_max_drift
+        target_bri = bri_lo + (bri_slider / 200.0) * (bri_hi - bri_lo)
+        cap.set(cv2.CAP_PROP_BRIGHTNESS, target_bri)
+
+    zoom_slider = cv2.getTrackbarPos(SLIDER_ZOOM, CONTROLS_WIN)
+    cfg.zoom_factor = max(cfg.zoom_min, min(zoom_slider / 100.0, cfg.zoom_max))
+
+
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
@@ -675,6 +908,10 @@ def main():
     exposure_ctrl.set_baseline(cap)
     adaptive = AdaptiveThresholds()
 
+    window_name = "Leaf Capture System"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    create_controls_window(cfg, window_name)
+
     stability_hist = deque(maxlen=cfg.stability_frames_required)
     prev_gray_full = None
     last_capture_time = 0.0
@@ -688,14 +925,22 @@ def main():
     last_status_print = 0.0
 
     print("Ready. Automatic exposure is running - point at a leaf, no setup needed.")
-    print("Controls: q=quit  s=manual save  i/k=exposure +/-  o/l=brightness +/-")
+    print("Keys: q=quit  s=manual save  i/k=exposure +/-  o/l=brightness +/-  m=debug mask")
+    print("Controls window: Exposure / Brightness / Zoom sliders + Auto/Manual toggle")
 
     while True:
-        ok, raw_frame = cap.read()
+        ok, raw_frame_full = cap.read()
         if not ok:
             print("Frame grab failed, retrying...")
             time.sleep(0.1)
             continue
+
+        read_controls(cap, cfg, exposure_ctrl)
+
+        # Digital zoom is applied first so every downstream step (detection,
+        # exposure sampling, gamma correction, cropping on save) operates on
+        # the already-zoomed frame and stays geometrically consistent.
+        raw_frame = apply_digital_zoom(raw_frame_full, cfg.zoom_factor)
 
         raw_gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
         frame = auto_gamma_correct(raw_frame)
@@ -747,7 +992,10 @@ def main():
             sharpness = compute_sharpness(gray_roi, roi_mask)
             vein_score = compute_vein_score(gray_roi, roi_mask)
 
-            cv2.rectangle(display, (x, y), (x2, y2), (60, 200, 60), 2)
+            # Bounding box is drawn unconditionally whenever a leaf is
+            # found - a thick outline, corner accents, and a label, so it
+            # can't be missed or blend into the background.
+            draw_leaf_bbox(display, bbox)
 
             if cfg.min_area_ratio <= area_ratio <= cfg.max_area_ratio \
                     and cfg.min_brightness <= brightness <= cfg.max_brightness:
@@ -779,6 +1027,9 @@ def main():
         is_stable = len(stability_hist) == stability_hist.maxlen and all(stability_hist)
 
         if is_stable and (now - last_capture_time) > cfg.capture_cooldown_sec:
+            # bbox here is the tight leaf box -> save_frame crops to just
+            # the leaf (plus a small margin), discarding the rest of the
+            # frame entirely.
             save_frame(frame, cfg, score, bbox=bbox)
             captures_count += 1
             _beep()
@@ -804,16 +1055,22 @@ def main():
 
         if (now - last_status_print) > 1.0:
             ready_str = "learned" if adaptive.ready else f"learning ({len(adaptive.sharp_samples)}/{adaptive.min_samples})"
+            mode_str = "MANUAL(locked)" if exposure_ctrl.manual_lock else (
+                "paused(key)" if exposure_ctrl.paused else "auto")
             print(f"[status] guidance='{guidance_text}'  score={score:.1f}  "
                   f"sharp={sharpness:.0f}/{sharp_thresh:.0f}  vein={vein_score:.1f}/{vein_thresh:.1f}  "
-                  f"adaptive={ready_str}  exposure={exposure_ctrl.last_status}")
+                  f"adaptive={ready_str}  mode={mode_str}  zoom={cfg.zoom_factor:.2f}x  "
+                  f"exposure={exposure_ctrl.last_status}")
             last_status_print = now
 
         draw_overlay(display, guidance_text, score, leaf_found,
                      len(stability_hist), stability_hist.maxlen,
                      captures_count, now < flash_until)
 
-        cv2.imshow("Leaf Capture System", display)
+        if cfg.show_debug_mask:
+            draw_debug_mask_inset(display, leaf_mask, leaf_found)
+
+        cv2.imshow(window_name, display)
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord('q'):
@@ -823,6 +1080,8 @@ def main():
             captures_count += 1
             _beep()
             flash_until = time.time() + cfg.capture_flash_sec
+        elif key == ord('m'):
+            cfg.show_debug_mask = not cfg.show_debug_mask
         elif key == ord('i'):
             exposure_ctrl.pause_for_manual_override()
             nudge_camera_property(cap, cv2.CAP_PROP_EXPOSURE, +1, "exposure +")
