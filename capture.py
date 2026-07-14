@@ -1,8 +1,4 @@
 """
-Intelligent Vision-Based Leaf Image Acquisition System
---------------------------------------------------------
-Runs on a fixed-focus webcam (e.g. Lenovo 300 FHD).
-
 1. FULLY AUTOMATIC by default - exposure, brightness, and sensor gain are
    continuously adjusted by the system itself, in any environment (indoor
    or outdoor), with no setup. Leaf detection works on any background.
@@ -22,16 +18,9 @@ Runs on a fixed-focus webcam (e.g. Lenovo 300 FHD).
         NOT silently resume automatic like the key-nudges do. Flip it
         back to Auto (1) to hand control back to the automatic loop.
 
-You'll see a bounding box drawn around the detected leaf on every frame
-it is found, a green "CAPTURED" flash on screen, and a running counter
-whenever a frame is saved.
-
 Press 'm' to toggle a small debug inset showing the raw detection mask -
 useful if the bounding box ever seems to disappear, since it shows
 exactly what the detector is (or isn't) seeing.
-
-USAGE
-    python leaf_capture_system.py
 
 CONTROLS (while a window is focused)
     q      - quit
@@ -48,14 +37,6 @@ CONTROLS (while a window is focused)
         Auto Mode      - 1 = automatic exposure (default), 0 = manual
                           (locks control to the Exposure/Brightness
                           sliders until switched back to 1)
-
-OUTPUT
-    Captured frames go to ./captures/leaf_YYYYMMDD_HHMMSS_<tag>_scoreXXX.jpg
-    Saved frames are cropped tightly around the detected leaf ONLY - the
-    rest of the frame is discarded before writing to disk.
-    tag = auto (normal capture), manual (you pressed 's'), or
-    timeout (guarantee-save fired before a fully sharp frame was seen -
-    check these, they may be soft).
 """
 
 import cv2
@@ -117,6 +98,66 @@ class Config:
     zoom_min: float = 1.0
     zoom_max: float = 3.0
 
+    # --- Cluttered-background robustness ---
+    # Candidate contours whose w/h ratio falls outside this range are
+    # rejected outright before scoring - real leaves don't come as thin
+    # slivers, but background clutter edges (mesh wires, table seams,
+    # shadow bands) often do.
+    leaf_aspect_min: float = 0.12
+    leaf_aspect_max: float = 8.0
+    # Switch hysteresis (see _pick_with_hysteresis): once a track exists,
+    # a DIFFERENT candidate must score at least this fraction higher
+    # before the detector switches to it - e.g. 0.2 means 20% better.
+    # Without this, two similarly-scored blobs (or the same object's
+    # contour splitting slightly differently frame to frame) makes the
+    # box visibly hop between them.
+    continuity_switch_margin: float = 0.2
+    # Display-only smoothing of the drawn box (see LeafTracker) - purely
+    # cosmetic, does not affect what gets measured/saved.
+    bbox_smooth_alpha: float = 0.45
+    bbox_hold_frames: int = 4
+
+    # --- Flicker ("random light flashing") smoothing ---
+    # Both the exposure controller and the gamma post-process react to a
+    # brightness reading; feeding them the raw single-frame value lets
+    # one noisy/clutter-confused frame yank exposure or gamma around,
+    # which reads on screen as a brightness "flash". EMA-smoothing the
+    # readings first fixes that without adding perceptible lag.
+    brightness_ema_alpha: float = 0.25
+    gamma_ema_alpha: float = 0.2
+    # The brightness reading source flips between "whole frame" (no leaf)
+    # and "leaf-only ROI" (leaf found) - a discontinuous jump right when a
+    # leaf enters/leaves frame. For the first N frames after that flip,
+    # use a slower EMA alpha so the exposure/gamma reaction to the jump
+    # itself is smoothed out, not just ordinary per-frame noise.
+    brightness_transition_alpha: float = 0.08
+    brightness_transition_hold_frames: int = 15
+
+    # --- Cluttered-background detection tuning ---
+    # A candidate only gets the temporal-continuity score boost once the
+    # tracker has held the SAME object for this many consecutive frames -
+    # otherwise a bad lock in the first frame or two would keep
+    # reinforcing itself every frame after (continuity favors "whatever we
+    # were already tracking", which is only trustworthy once it's proven
+    # itself over a few frames).
+    continuity_min_confirmed_frames: int = 5
+    # Every N frames, force one "cold" comparison with continuity disabled
+    # so a better candidate elsewhere in frame (e.g. the real leaf finally
+    # entering view after the tracker locked onto clutter) can win instead
+    # of being permanently out-scored by the continuity bonus.
+    cold_recheck_interval_frames: int = 90
+
+    # --- Capture refinement/rejection ---
+    # Once the stability window first completes, keep evaluating for this
+    # many extra frames and save the best-scoring one of them, instead of
+    # whichever frame happened to complete the streak first.
+    capture_refine_frames: int = 6
+    # If True, the 9s timeout guarantee never saves a frame below
+    # low_confidence_score - it keeps waiting (and restarts its own timer)
+    # instead. If False (default), it saves the best-seen frame anyway so
+    # a photo is guaranteed, flagged "timeout"/low-confidence.
+    strict_reject_blurry: bool = False
+
     # --- Debug ---
     show_debug_mask: bool = False
 
@@ -126,6 +167,12 @@ class Config:
 # --------------------------------------------------------------------------- #
 
 def estimate_background_color(frame, margin=50):
+    """Median color sampled from a ring of border patches. This is a
+    last-resort estimate (see detect_leaf) precisely because it assumes a
+    roughly uniform background - true of a plain mat/table, false of a
+    genuinely cluttered scene. Sampling all four corners/edges (not just
+    the top) at least keeps it from being fooled by a background that's
+    uniform along one side but not another."""
     h, w = frame.shape[:2]
     patches = [
         frame[0:margin, 0:margin],
@@ -133,6 +180,9 @@ def estimate_background_color(frame, margin=50):
         frame[h - margin:h, 0:margin],
         frame[h - margin:h, w - margin:w],
         frame[0:margin, w // 2 - margin:w // 2 + margin],
+        frame[h - margin:h, w // 2 - margin:w // 2 + margin],
+        frame[h // 2 - margin:h // 2 + margin, 0:margin],
+        frame[h // 2 - margin:h // 2 + margin, w - margin:w],
     ]
     samples = np.vstack([p.reshape(-1, 3) for p in patches])
     return np.median(samples, axis=0)
@@ -159,7 +209,7 @@ def excess_green_mask(frame):
     fixed, more inclusive ceiling whenever Otsu would have picked
     something higher - this keeps paler green objects in the mask too,
     at the cost of possibly including some background as well. That's an
-    acceptable trade because _best_valid_contour (below) then screens
+    acceptable trade because _score_candidates (below) then screens
     candidates on shape, solidity, AND color plausibility rather than
     blindly taking the largest blob."""
     b, g, r = cv2.split(frame.astype(np.float32))
@@ -167,7 +217,7 @@ def excess_green_mask(frame):
     exg_u8 = np.clip(exg, 0, 255).astype(np.uint8)
     exg_blur = cv2.GaussianBlur(exg_u8, (5, 5), 0)
     otsu_val, _ = cv2.threshold(exg_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    inclusive_thresh = min(otsu_val, 20.0)
+    inclusive_thresh = min(otsu_val, 16.0)
     _, mask = cv2.threshold(exg_blur, inclusive_thresh, 255, cv2.THRESH_BINARY)
     return mask
 
@@ -203,19 +253,6 @@ def _mean_bgr_in_mask(frame, mask):
     return b, g, r
 
 
-def _is_plausible_leaf_color(frame, mask, margin=3.0):
-    """Sanity check applied to WHATEVER contour a detector picked: the
-    average color inside it must actually be green-dominant (G clearly
-    above both R and B). This is what stops a skin-toned hand, wood grain,
-    or a brownish background from ever being accepted as 'the leaf', even
-    if it happened to pass the shape/solidity checks."""
-    means = _mean_bgr_in_mask(frame, mask)
-    if means is None:
-        return False
-    b, g, r = means
-    return (g - r) > margin and (g - b) > margin
-
-
 def background_diff_mask(frame, bg_color):
     diff = np.linalg.norm(frame.astype(np.float32) - bg_color.astype(np.float32), axis=2)
     diff_u8 = np.clip(diff, 0, 255).astype(np.uint8)
@@ -224,33 +261,72 @@ def background_diff_mask(frame, bg_color):
     return mask
 
 
-def _largest_valid_contour(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, min_solidity=0.0):
-    """Picks the best candidate contour, NOT simply the largest.
+def _bbox_iou(a, b):
+    """Intersection-over-union of two (x, y, w, h) boxes, 0.0 if disjoint
+    or either box is missing/degenerate."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return 0.0
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    iw, ih = max(ix2 - ix1, 0), max(iy2 - iy1, 0)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
 
-    Why: once excess_green_mask() was made more inclusive (see fix above),
-    a small but very saturated background object (e.g. a green mesh)
-    and a large but paler leaf can BOTH show up as separate contours in
-    the same mask. Every candidate is scored on a combination of (a) how
-    much of the frame it covers and (b) how clearly green-dominant its
-    average color is (green minus red/blue). A candidate that isn't
-    green-dominant at all is discarded outright, regardless of size - so
-    a compact, highly-saturated patch can no longer beat out a bigger,
-    correctly-toned leaf just by being "greener"."""
+
+def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, min_solidity=0.0,
+                       aspect_min=None, aspect_max=None, top_k=3):
+    """Scores every plausible contour in `mask` on its own merits (size,
+    color, shape only - no notion of tracking/continuity here, see
+    detect_leaf's _pick_with_hysteresis for that) and returns the top_k
+    best as a list of dicts (sorted best-first): {mask, bbox, area_ratio,
+    score}. Returning more than one candidate - instead of just a single
+    winner - is what lets detect_leaf() compare candidates ACROSS detector
+    tiers (ExG vs HSV) rather than blindly accepting whichever tier
+    happens to run first; see detect_leaf's docstring.
+
+    Guards applied to every candidate before it's even scored:
+      - area_ratio must fall within [min_ratio, max_ratio].
+      - aspect_min/aspect_max reject thin slivers (mesh wire, table seam,
+        shadow band) - real leaves don't come that elongated.
+      - min_solidity rejects rough/jagged/branching blobs.
+      - color margin (green minus red/blue) must be green-dominant, with
+        BOTH an absolute floor and a floor relative to the candidate's own
+        brightness. A fixed absolute cutoff alone under-rejects noise in
+        bright scenes and over-rejects real leaves in dim ones, since raw
+        color differences compress toward zero as brightness drops.
+
+    Scoring, for whatever survives the gates:
+      - base = area_ratio x (1 + color_margin factor) - bigger and more
+        confidently green scores higher.
+      - x circularity factor (4*pi*area/perimeter^2, capped at 1.0) - real
+        leaves are reasonably compact; jagged/branching clutter (mesh,
+        cast shadows, wires) scores lower here even if it slipped past
+        the solidity gate."""
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None, None, 0.0
+        return []
 
-    best_mask, best_bbox, best_area_ratio, best_score = None, None, 0.0, -1.0
-
+    candidates = []
     for c in contours:
         area = cv2.contourArea(c)
         area_ratio = area / frame_area
         if area_ratio < min_ratio or area_ratio > max_ratio:
             continue
+
+        x, y, w, h = cv2.boundingRect(c)
+        if aspect_min is not None and aspect_max is not None and h > 0:
+            aspect = w / h
+            if aspect < aspect_min or aspect > aspect_max:
+                continue  # too sliver-like to plausibly be a leaf
 
         if min_solidity > 0:
             hull = cv2.convexHull(c)
@@ -267,68 +343,178 @@ def _largest_valid_contour(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.
             continue
         cb, cg, cr = means
         color_margin = min(cg - cr, cg - cb)
-        if color_margin <= 3.0:
+        mean_luma = (cb + cg + cr) / 3.0
+        relative_margin = color_margin / max(mean_luma, 1.0)
+        if color_margin <= 1.3 or relative_margin <= 0.04:
             continue  # not actually green-dominant - never let this win on size alone
 
-        score = area_ratio * (1.0 + min(color_margin, 60.0) / 60.0)
-        if score > best_score:
-            best_score = score
-            best_area_ratio = area_ratio
-            x, y, w, h = cv2.boundingRect(c)
-            best_bbox = (x, y, w, h)
-            best_mask = candidate_mask
+        perimeter = cv2.arcLength(c, True)
+        circularity = min((4.0 * np.pi * area) / (perimeter ** 2), 1.0) if perimeter > 0 else 0.0
+        shape_factor = 0.5 + 0.5 * circularity
 
-    if best_mask is None:
-        return None, None, 0.0
+        score = area_ratio * (1.0 + min(color_margin, 60.0) / 60.0) * shape_factor
+        candidates.append({"mask": candidate_mask, "bbox": (x, y, w, h),
+                            "area_ratio": area_ratio, "score": score})
 
-    return best_mask, best_bbox, best_area_ratio
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates[:top_k]
 
 
-def detect_leaf(frame, cfg: Config):
-    """Detection order, each gated by _is_plausible_leaf_color so a hand,
-    wall, or wood surface can never be accepted just because it happened
-    to pass a shape/solidity check:
+def _pick_with_hysteresis(candidates, prev_bbox, switch_margin, min_iou=0.15):
+    """Chooses which of `candidates` (already-scored, non-empty) to use
+    this frame. If prev_bbox is given and some candidate substantially
+    overlaps it (the object we were already tracking), that candidate
+    wins UNLESS a DIFFERENT candidate scores at least switch_margin
+    higher - this is what stops the box hopping between two similarly-
+    scored blobs, or between two slightly different contour splits of the
+    same object, on every other frame. A genuinely better candidate still
+    wins; if nothing overlaps prev_bbox at all (the tracked object is
+    really gone, or hysteresis is disabled by passing prev_bbox=None),
+    the plain best-scoring candidate wins with no resistance."""
+    best = max(candidates, key=lambda c: c["score"])
+    if prev_bbox is None:
+        return best
+
+    tracked = max(candidates, key=lambda c: _bbox_iou(c["bbox"], prev_bbox))
+    if _bbox_iou(tracked["bbox"], prev_bbox) < min_iou:
+        return best  # nothing here is really "the same object" any more
+
+    if best is tracked or best["score"] <= tracked["score"] * (1.0 + switch_margin):
+        return tracked  # not a big enough improvement - keep what we had
+    return best  # genuinely better - allow the switch
+
+
+def detect_leaf(frame, cfg: Config, prev_bbox=None, apply_hysteresis=True):
+    """Detection order:
 
     1. Excess-green (ExG) segmentation - the primary detector. Robust to
        background AND to skin tone, since it reasons about green-channel
        dominance rather than a fixed hue window.
     2. HSV true-green hue mask - secondary check, catches cases ExG
        misses (e.g. very low-saturation lighting).
-    3. Background-difference - last resort for a badly backlit leaf,
-       still gated by the same color-plausibility check afterward.
+
+    Candidates from tiers 1 and 2 are pooled and compared TOGETHER - the
+    winner is whichever candidate scores highest across BOTH tiers, not
+    just whichever tier happened to run first. This matters in clutter:
+    previously, if ExG's single best guess was a background object, the
+    real leaf was never even considered even if it was a strong candidate
+    (in ExG as a runner-up, or in HSV).
+
+    3. Background-difference - true last resort, only tried when 1 and 2
+       together produce nothing at all. It assumes a roughly uniform
+       background (sampled from the frame border), which is usually false
+       in genuinely cluttered scenes, so it's deliberately the weakest
+       option rather than a peer of 1 and 2.
+
+    prev_bbox/apply_hysteresis implement switch hysteresis (see
+    _pick_with_hysteresis): once a track exists, a different candidate
+    must score meaningfully higher before the detector switches to it,
+    which is what stops the box hopping between two similarly-scored
+    blobs frame to frame. The caller (main loop) is expected to pass
+    apply_hysteresis=False until a track is "confirmed" (held for several
+    consecutive frames) and periodically force it False again for a
+    "cold" recheck, so an early bad lock can't permanently reinforce
+    itself - hysteresis never overrides the color/shape gates, only which
+    already-valid candidate wins.
 
     Returns (mask_used_for_detection, bbox_or_None, area_ratio).
     mask_used_for_detection is always returned (even on failure) so the
     caller can show it in the debug inset."""
     frame_area = frame.shape[0] * frame.shape[1]
+    hyst_bbox = prev_bbox if apply_hysteresis else None
+
+    # max_ratio caps how much of the frame a single candidate is allowed
+    # to cover before it's rejected outright - this is the primary guard
+    # against background merging with the leaf into one big blob and
+    # getting accepted as "the leaf". Set just above cfg.max_area_ratio
+    # (the "too close, move away" guidance threshold) so a legitimately
+    # large/close leaf still gets detected, but nowhere near "most of the
+    # frame" can ever pass.
+    max_candidate_ratio = min(cfg.max_area_ratio + 0.10, 0.65)
 
     exg_mask = excess_green_mask(frame)
-    exg_result = _largest_valid_contour(frame, exg_mask, frame_area, max_ratio=0.75,
-                                         min_ratio=0.003, min_solidity=0.30)
-    if exg_result[1] is not None:
-        return exg_result[0], exg_result[1], exg_result[2]
+    exg_candidates = _score_candidates(frame, exg_mask, frame_area, max_ratio=max_candidate_ratio,
+                                        min_ratio=0.003, min_solidity=0.28,
+                                        aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
+                                        top_k=3)
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower = np.array(cfg.hsv_lower, dtype=np.uint8)
     upper = np.array(cfg.hsv_upper, dtype=np.uint8)
     hue_mask = cv2.inRange(hsv, lower, upper)
-    hue_result = _largest_valid_contour(frame, hue_mask, frame_area, max_ratio=0.75,
-                                         min_ratio=0.003, min_solidity=0.30)
-    if hue_result[1] is not None:
-        return hue_result[0], hue_result[1], hue_result[2]
+    hue_candidates = _score_candidates(frame, hue_mask, frame_area, max_ratio=max_candidate_ratio,
+                                        min_ratio=0.003, min_solidity=0.28,
+                                        aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
+                                        top_k=3)
+
+    pooled = exg_candidates + hue_candidates
+    if pooled:
+        winner = _pick_with_hysteresis(pooled, hyst_bbox, cfg.continuity_switch_margin)
+        return winner["mask"], winner["bbox"], winner["area_ratio"]
 
     bg_color = estimate_background_color(frame)
     bg_mask = background_diff_mask(frame, bg_color)
-    bg_result = _largest_valid_contour(frame, bg_mask, frame_area, max_ratio=0.5,
-                                        min_ratio=0.003, min_solidity=0.35)
-    if bg_result[1] is not None:
-        return bg_result[0], bg_result[1], bg_result[2]
+    bg_candidates = _score_candidates(frame, bg_mask, frame_area, max_ratio=0.45,
+                                       min_ratio=0.003, min_solidity=0.30,
+                                       aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
+                                       top_k=3)
+    if bg_candidates:
+        winner = _pick_with_hysteresis(bg_candidates, hyst_bbox, cfg.continuity_switch_margin)
+        return winner["mask"], winner["bbox"], winner["area_ratio"]
 
     # Nothing passed validation - still hand back the combined raw masks
     # so the debug inset ('m' key) can show *why* nothing matched, instead
     # of a blank screen.
     combined = cv2.bitwise_or(exg_mask, cv2.bitwise_or(hue_mask, bg_mask))
     return combined, None, 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Temporal bbox tracking - smooths the DRAWN box and briefly holds it
+# through a one- or two-frame detection dropout (common in clutter, where a
+# candidate contour can flicker in/out of the winning score by a hair from
+# one frame to the next). Display-only: guidance, quality scoring, and what
+# gets saved all continue to use the raw, un-smoothed per-frame detection -
+# this only stops the on-screen box from visibly jittering/vanishing.
+# --------------------------------------------------------------------------- #
+
+class LeafTracker:
+    def __init__(self, smooth_alpha: float, hold_frames: int):
+        self.smooth_alpha = smooth_alpha
+        self.hold_frames = hold_frames
+        self.smoothed_bbox = None
+        self.frames_since_seen = 0
+        # Consecutive frames the SAME track has been held (survives brief
+        # hold-frame flicker, resets on a real loss). Used by the main
+        # loop to decide when continuity scoring is trustworthy enough to
+        # enable (see Config.continuity_min_confirmed_frames) and when the
+        # smoothed box is stable enough to drive measurement/capture, not
+        # just the display (see Config.continuity_min_confirmed_frames
+        # usage in main()).
+        self.confirmed_frames = 0
+
+    def update(self, bbox):
+        """Feed this frame's raw detection (or None). Returns the box to
+        draw: exponentially smoothed while the leaf is seen, held steady
+        for up to hold_frames after it briefly drops out, then cleared."""
+        if bbox is not None:
+            if self.smoothed_bbox is None:
+                self.smoothed_bbox = tuple(float(v) for v in bbox)
+            else:
+                a = self.smooth_alpha
+                self.smoothed_bbox = tuple(
+                    a * nv + (1 - a) * ov for nv, ov in zip(bbox, self.smoothed_bbox))
+            self.frames_since_seen = 0
+            self.confirmed_frames += 1
+        else:
+            self.frames_since_seen += 1
+            if self.frames_since_seen > self.hold_frames:
+                self.smoothed_bbox = None
+                self.confirmed_frames = 0
+
+        if self.smoothed_bbox is None:
+            return None
+        return tuple(int(round(v)) for v in self.smoothed_bbox)
 
 
 # --------------------------------------------------------------------------- #
@@ -511,7 +697,7 @@ def open_camera(cfg: Config):
     if not cap.isOpened():
         cap = cv2.VideoCapture(cfg.camera_index)
 
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # type: ignore[attr-defined]
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
 
@@ -563,6 +749,31 @@ class AutoExposureController:
        recorded at startup, and a near-black frame triggers an immediate
        reset to that baseline rather than continued drift.
 
+    Reliability additions:
+    3. Not every property is actually settable on every UVC driver -
+       cap.set() silently no-ops on many webcams instead of raising, which
+       previously meant the loop could print "raising"/"stable" forever
+       while nothing physically changed. set_baseline() now probes each of
+       EXPOSURE/GAIN/BRIGHTNESS with a small test change and only budgets
+       adjustments to properties that actually moved.
+    4. Step size used to be a fixed absolute delta (e.g. always "+4" on
+       GAIN), which is meaningless without knowing that driver's real
+       range - too slow to converge on some cameras, too twitchy on
+       others. Steps are now a fraction of each property's own configured
+       drift band (*_step_frac), so convergence speed is consistent
+       regardless of the underlying units.
+    5. A small leaky-integral term is blended with the proportional error
+       so a persistent (not just momentary) under/over-exposure pushes
+       harder over time, damping the hunting a pure-proportional loop is
+       prone to - especially now that the input itself is EMA-smoothed
+       upstream (see brightness_ema_alpha), which adds a bit of lag.
+    6. The startup baseline used to be permanent for the whole session: if
+       lighting changed drastically (room -> sunlit window) the drift
+       ceiling around that one baseline could permanently block reaching
+       the new optimum. If a property stays pinned at its drift-band edge
+       for a sustained stretch, that property's baseline is re-centered
+       toward the pinned side, freeing up headroom to keep converging.
+
     IMPORTANT: pass in the brightness measured over the LEAF region when
     one is visible, not the whole frame - otherwise a bright/dark
     background can pull exposure the wrong way for the leaf itself."""
@@ -571,12 +782,16 @@ class AutoExposureController:
     TARGET_HIGH = 165.0
     TARGET_MID = (TARGET_LOW + TARGET_HIGH) / 2
     RESUME_AFTER_IDLE_SEC = 20.0
+    PINNED_CHECKS_BEFORE_REBASELINE = 5  # ~5 check-intervals stuck at the drift edge
 
-    def __init__(self, check_interval_frames: int = 10, max_step: float = 1.5,
-                 exposure_max_drift: float = 6.0, gain_max_drift: float = 120.0,
-                 brightness_max_drift: float = 80.0):
+    def __init__(self, check_interval_frames: int = 6, max_step: float = 1.0,
+                 exposure_max_drift: float = 10.0, gain_max_drift: float = 150.0,
+                 brightness_max_drift: float = 120.0,
+                 exposure_step_frac: float = 0.22, gain_step_frac: float = 0.22,
+                 brightness_step_frac: float = 0.22, integral_gain: float = 0.15):
         self.check_interval = check_interval_frames
         self.max_step = max_step
+        self.integral_gain = integral_gain
         self.frame_count = 0
         self.paused = False
         self.resume_at = 0.0
@@ -588,37 +803,180 @@ class AutoExposureController:
         self.exposure_max_drift = exposure_max_drift
         self.gain_max_drift = gain_max_drift
         self.brightness_max_drift = brightness_max_drift
+        self.exposure_step_frac = exposure_step_frac
+        self.gain_step_frac = gain_step_frac
+        self.brightness_step_frac = brightness_step_frac
+        self.exposure_supported = True
+        self.gain_supported = True
+        self.brightness_supported = True
+        self.hardware_control_available = True
         self._black_frame_streak = 0
+        self._white_frame_streak = 0
+        self._error_integral = 0.0
+        self._pinned_checks = {"exposure": 0, "gain": 0, "brightness": 0}
+
+    def _probe_support(self, cap, prop, test_delta, epsilon):
+        """Small deliberate change + readback to find out whether this
+        driver actually honors writes to `prop`, instead of assuming it
+        does (cap.set() silently no-ops on many drivers). Restores the
+        original value before returning either way."""
+        before = cap.get(prop)
+        if before == -1:
+            return False, before
+        cap.set(prop, before + test_delta)
+        after = cap.get(prop)
+        cap.set(prop, before)
+        supported = abs(after - before) > epsilon
+        return supported, before
+
+    def _verify_property_affects_frame(self, cap, prop, test_delta, flush_frames=5):
+        """A readback match (_probe_support) isn't proof the hardware
+        actually changed - some UVC drivers just echo back whatever you
+        write without the sensor doing anything, which would otherwise
+        look "supported" forever while never actually affecting the
+        picture. This applies a real, sizeable change and checks whether
+        freshly-grabbed FRAMES actually got measurably brighter/darker,
+        which is the only way to really know. flush_frames gives the
+        driver's internal buffer time to catch up to a new setting before
+        each measurement."""
+        def _mean_after_flush():
+            ok, fr = False, None
+            for _ in range(flush_frames):
+                ok, fr = cap.read()
+            if not ok or fr is None:
+                return None
+            return float(np.mean(fr))
+
+        before_val = cap.get(prop)
+        before_mean = _mean_after_flush()
+        if before_mean is None:
+            return False
+
+        cap.set(prop, before_val + test_delta)
+        after_mean = _mean_after_flush()
+
+        cap.set(prop, before_val)
+        _mean_after_flush()  # let it settle back before handing control back
+
+        if after_mean is None:
+            return False
+        return abs(after_mean - before_mean) > 3.0
 
     def set_baseline(self, cap):
         """Call once after the camera has warmed up. Forces the camera out
-        of its own auto-exposure mode and records the current
-        exposure/gain/brightness as the safe anchor all later adjustments
-        are bounded around."""
+        of its own auto-exposure mode, probes which properties this driver
+        actually honors - both by readback AND by checking real frames
+        actually change - and records the current exposure/gain/brightness
+        as the safe anchor all later adjustments are bounded around."""
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)   # DirectShow convention: 0.25 = manual
         if cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) not in (0.25,):
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # V4L2 convention: 1 = manual
         print(f"  AUTO_EXPOSURE after manual-mode request: {cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)}")
 
-        self.baseline_exposure = cap.get(cv2.CAP_PROP_EXPOSURE)
-        self.baseline_gain = cap.get(cv2.CAP_PROP_GAIN)
-        self.baseline_brightness = cap.get(cv2.CAP_PROP_BRIGHTNESS)
-        print(f"  baseline exposure={self.baseline_exposure:.2f}  "
-              f"gain={self.baseline_gain:.2f}  brightness={self.baseline_brightness:.2f}")
+        self.exposure_supported, self.baseline_exposure = self._probe_support(
+            cap, cv2.CAP_PROP_EXPOSURE, 1.0, 0.05)
+        self.gain_supported, self.baseline_gain = self._probe_support(
+            cap, cv2.CAP_PROP_GAIN, 20.0, 1.0)
+        self.brightness_supported, self.baseline_brightness = self._probe_support(
+            cap, cv2.CAP_PROP_BRIGHTNESS, 20.0, 1.0)
+
+        readback_str = (f"readback: exposure={'OK' if self.exposure_supported else 'no'} "
+                         f"gain={'OK' if self.gain_supported else 'no'} "
+                         f"brightness={'OK' if self.brightness_supported else 'no'}")
+        print(f"  baseline exposure={self.baseline_exposure:.2f}  gain={self.baseline_gain:.2f}  "
+              f"brightness={self.baseline_brightness:.2f}  ({readback_str})")
+
+        # Readback alone can lie (echo-only drivers) - confirm each
+        # property that passed readback ALSO visibly changes real frames.
+        if self.exposure_supported:
+            self.exposure_supported = self._verify_property_affects_frame(
+                cap, cv2.CAP_PROP_EXPOSURE, 3.0)
+        if self.gain_supported:
+            self.gain_supported = self._verify_property_affects_frame(
+                cap, cv2.CAP_PROP_GAIN, 60.0)
+        if self.brightness_supported:
+            self.brightness_supported = self._verify_property_affects_frame(
+                cap, cv2.CAP_PROP_BRIGHTNESS, 60.0)
+        self.hardware_control_available = (
+            self.exposure_supported or self.gain_supported or self.brightness_supported)
+
+        print(f"  frame-verified: exposure={'OK' if self.exposure_supported else 'UNSUPPORTED'}  "
+              f"gain={'OK' if self.gain_supported else 'UNSUPPORTED'}  "
+              f"brightness={'OK' if self.brightness_supported else 'UNSUPPORTED'}")
+        if not self.hardware_control_available:
+            print("  WARNING: this camera driver accepts EXPOSURE/GAIN/BRIGHTNESS writes but "
+                  "the actual video never got measurably brighter/darker when tested - it's "
+                  "likely just echoing values back without the sensor changing. Automatic (and "
+                  "manual key/slider) exposure control has no real effect on this device; "
+                  "falling back entirely on the software brightness compensation.")
 
     def _clamped_set(self, cap, prop, new_val, baseline, max_drift):
-        if baseline is not None:
-            low, high = baseline - max_drift, baseline + max_drift
-            new_val = max(low, min(new_val, high))
+        low, high = baseline - max_drift, baseline + max_drift
+        new_val = max(low, min(new_val, high))
         cap.set(prop, new_val)
-        return cap.get(prop)
+        return cap.get(prop), low, high
+
+    def _adjust_property(self, cap, prop, direction, step, prop_name):
+        """Applies one bounded step to a single camera property, tracks
+        whether it's pinned at its drift-band edge, and re-centers the
+        baseline if it's been pinned there for a long stretch (see class
+        docstring, point 6). Returns (moved, applied_value) - moved is
+        False when the requested step didn't actually change the reported
+        value (already clamped to the nearest edge), so callers can
+        cascade to the next lever exactly as before."""
+        baseline_attr = f"baseline_{prop_name}"
+        max_drift_attr = f"{prop_name}_max_drift"
+        baseline = getattr(self, baseline_attr)
+        max_drift = getattr(self, max_drift_attr)
+
+        cur = cap.get(prop)
+        applied, low, high = self._clamped_set(cap, prop, cur + direction * step, baseline, max_drift)
+        moved = abs(applied - cur) > 0.05
+
+        at_edge = (direction > 0 and applied >= high - 1e-6) or (direction < 0 and applied <= low + 1e-6)
+        if at_edge:
+            self._pinned_checks[prop_name] += 1
+            if self._pinned_checks[prop_name] >= self.PINNED_CHECKS_BEFORE_REBASELINE:
+                shift = direction * max_drift * 0.8
+                setattr(self, baseline_attr, baseline + shift)
+                self._pinned_checks[prop_name] = 0
+                print(f"  [{prop_name}] pinned at drift limit for a while - re-centering "
+                      f"baseline by {shift:+.2f} to free up headroom")
+        else:
+            self._pinned_checks[prop_name] = 0
+
+        return moved, applied
 
     def reset_to_baseline(self, cap):
         if self.baseline_exposure is not None:
             cap.set(cv2.CAP_PROP_EXPOSURE, self.baseline_exposure)
             cap.set(cv2.CAP_PROP_GAIN, self.baseline_gain)
             cap.set(cv2.CAP_PROP_BRIGHTNESS, self.baseline_brightness)
+            self._error_integral = 0.0
             self.last_status = "reset to baseline (frame went black)"
+
+    def force_toward_dark_end(self, cap):
+        """Snaps every supported property straight to the DARKEST edge of
+        its own drift band, instead of continuing the gradual per-check
+        proportional step. Mirrors reset_to_baseline's near-black safety
+        net: a sustained near-white reading means the gradual correction
+        isn't keeping up (or is being fought by something else), so a
+        hard, immediate correction is used instead of creeping toward it
+        one small step at a time."""
+        if self.exposure_supported and self.baseline_exposure is not None:
+            self._clamped_set(cap, cv2.CAP_PROP_EXPOSURE,
+                               self.baseline_exposure - self.exposure_max_drift,
+                               self.baseline_exposure, self.exposure_max_drift)
+        if self.gain_supported and self.baseline_gain is not None:
+            self._clamped_set(cap, cv2.CAP_PROP_GAIN,
+                               self.baseline_gain - self.gain_max_drift,
+                               self.baseline_gain, self.gain_max_drift)
+        if self.brightness_supported and self.baseline_brightness is not None:
+            self._clamped_set(cap, cv2.CAP_PROP_BRIGHTNESS,
+                               self.baseline_brightness - self.brightness_max_drift,
+                               self.baseline_brightness, self.brightness_max_drift)
+        self._error_integral = 0.0
+        self.last_status = "forced toward minimum (frame stayed near-white)"
 
     def pause_for_manual_override(self):
         """Temporary pause used by the i/k/o/l keys - resumes on its own."""
@@ -638,6 +996,10 @@ class AutoExposureController:
         if self.manual_lock:
             # Fully hands-off: the Controls sliders are driving exposure/
             # brightness directly elsewhere in the main loop.
+            return
+
+        if not self.hardware_control_available:
+            self.last_status = "no hardware exposure control - relying on software compensation"
             return
 
         if self.paused:
@@ -660,6 +1022,19 @@ class AutoExposureController:
         else:
             self._black_frame_streak = 0
 
+        # Symmetric safety net for the opposite extreme: a run of
+        # consecutive near-white (blown-out) frames means the gradual
+        # per-check correction isn't recovering fast enough - force a
+        # hard snap toward the dark end instead of continuing to creep.
+        if mean_brightness > 247.0:
+            self._white_frame_streak += 1
+            if self._white_frame_streak >= 3:
+                self.force_toward_dark_end(cap)
+                self._white_frame_streak = 0
+            return
+        else:
+            self._white_frame_streak = 0
+
         self.frame_count += 1
         if self.frame_count % self.check_interval != 0:
             return
@@ -668,41 +1043,70 @@ class AutoExposureController:
 
         if self.TARGET_LOW <= mean <= self.TARGET_HIGH:
             self.last_status = f"stable (leaf mean {mean:.0f})"
+            self._error_integral *= 0.5  # decay faster once in-band, avoid stale windup
             return
 
         error = self.TARGET_MID - mean
-        direction = 1.0 if error > 0 else -1.0
-        magnitude = min(abs(error) / 20.0, self.max_step)
+        # Leaky integral: a fading memory of recent error so a PERSISTENT
+        # miss pushes harder over time, without one old extreme value
+        # dominating forever (clamped, i.e. anti-windup).
+        self._error_integral = max(-200.0, min(self._error_integral * 0.85 + error, 200.0))
 
-        cur_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
-        applied_exp = self._clamped_set(cap, cv2.CAP_PROP_EXPOSURE, cur_exp + direction * magnitude,
-                                         self.baseline_exposure, self.exposure_max_drift)
-        exposure_hit_limit = abs(applied_exp - cur_exp) < 0.05
+        proportional = max(-1.0, min(error / 40.0, 1.0))
+        combined = max(-1.0, min(proportional + self.integral_gain * (self._error_integral / 200.0), 1.0))
+        direction = 1.0 if combined >= 0 else -1.0
+        step_frac = min(abs(combined), self.max_step)
 
-        if exposure_hit_limit and direction > 0:
-            cur_gain = cap.get(cv2.CAP_PROP_GAIN)
-            self._clamped_set(cap, cv2.CAP_PROP_GAIN, cur_gain + magnitude * 4,
-                               self.baseline_gain, self.gain_max_drift)
-        elif exposure_hit_limit and direction < 0:
-            cur_bri = cap.get(cv2.CAP_PROP_BRIGHTNESS)
-            self._clamped_set(cap, cv2.CAP_PROP_BRIGHTNESS, cur_bri - magnitude * 4,
-                               self.baseline_brightness, self.brightness_max_drift)
-        else:
-            cur_bri = cap.get(cv2.CAP_PROP_BRIGHTNESS)
-            self._clamped_set(cap, cv2.CAP_PROP_BRIGHTNESS, cur_bri + direction * magnitude * 2,
-                               self.baseline_brightness, self.brightness_max_drift)
+        moved = False
+        if self.exposure_supported:
+            moved, _ = self._adjust_property(
+                cap, cv2.CAP_PROP_EXPOSURE, direction,
+                step_frac * self.exposure_max_drift * self.exposure_step_frac, "exposure")
+
+        if not moved and direction > 0 and self.gain_supported:
+            self._adjust_property(
+                cap, cv2.CAP_PROP_GAIN, direction,
+                step_frac * self.gain_max_drift * self.gain_step_frac, "gain")
+        elif not moved and direction < 0 and self.brightness_supported:
+            self._adjust_property(
+                cap, cv2.CAP_PROP_BRIGHTNESS, direction,
+                step_frac * self.brightness_max_drift * self.brightness_step_frac, "brightness")
+        elif moved and self.brightness_supported:
+            # Exposure alone is handling most of the correction - a small
+            # brightness nudge in the same direction speeds convergence.
+            self._adjust_property(
+                cap, cv2.CAP_PROP_BRIGHTNESS, direction,
+                step_frac * self.brightness_max_drift * self.brightness_step_frac * 0.5, "brightness")
 
         word = "raising" if direction > 0 else "lowering"
         self.last_status = f"{word} (leaf mean {mean:.0f})"
 
 
-def auto_gamma_correct(bgr, target_mean=140.0, tolerance=12.0):
+def auto_gamma_correct(bgr, target_mean=140.0, tolerance=12.0, smoothed_mean=None):
     """Local shadow-lifting (CLAHE on L-channel) so a bright/uneven
-    background doesn't hide a dark subject. The global gamma trim only
-    kicks in when brightness is actually off target - previously it ran
-    unconditionally every frame on top of the hardware exposure control,
-    which double-corrected and amplified noise, hurting apparent
-    sharpness/vein detail."""
+    background doesn't hide a dark subject, followed by a LINEAR
+    multiplicative brightness scale toward target_mean.
+
+    A gamma/power-law curve (the previous approach here) has almost no
+    effect near the ends of the 0-255 range: for a pixel already at 230,
+    (230/255)^n stays close to 230/255 for nearly any n, so a genuinely
+    overexposed frame barely moves even with the correction pointed the
+    right direction - the picture can stay blown-out white regardless.
+    A flat multiplicative scale (output = input * scale) has no such
+    dead zone: it pulls EVERY pixel, including near-white ones,
+    proportionally toward target. It can't recover pixels that are
+    already fully clipped to 255 (no software post-process can - only
+    reducing the camera's real exposure prevents clipping in the first
+    place), but it does pull the rest of the frame - including the
+    leaf's own midtones - into a usable range instead of leaving them
+    pinned near white.
+
+    smoothed_mean, when given, is an EMA of this reading from prior
+    frames (see gamma_ema_alpha) and is what actually drives the
+    correction strength - a single noisy or clutter-confused frame's raw
+    mean can no longer yank it around and read as a brightness "flash".
+    The function still returns this frame's raw (un-smoothed) mean as
+    raw_mean so the caller can fold it into the EMA for the next call."""
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -710,12 +1114,12 @@ def auto_gamma_correct(bgr, target_mean=140.0, tolerance=12.0):
     result = cv2.cvtColor(cv2.merge((l_eq, a, b)), cv2.COLOR_LAB2BGR)
 
     gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-    mean = float(np.mean(gray))
+    raw_mean = float(np.mean(gray))
+    mean = raw_mean if smoothed_mean is None else smoothed_mean
     if mean > 1 and abs(mean - target_mean) > tolerance:
-        gamma = np.clip(np.log(target_mean / 255.0 + 1e-6) / np.log(mean / 255.0 + 1e-6), 0.7, 1.5)
-        table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255 for i in range(256)]).astype("uint8")
-        result = cv2.LUT(result, table)
-    return result
+        scale = np.clip(target_mean / mean, 0.3, 3.0)
+        result = np.clip(result.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+    return result, raw_mean
 
 
 # --------------------------------------------------------------------------- #
@@ -939,7 +1343,8 @@ def read_controls(cap, cfg: Config, exposure_ctrl: AutoExposureController):
     elif auto_val == 0 and not exposure_ctrl.manual_lock:
         exposure_ctrl.enable_manual_lock()
 
-    if exposure_ctrl.manual_lock and exposure_ctrl.baseline_exposure is not None:
+    if (exposure_ctrl.manual_lock and exposure_ctrl.baseline_exposure is not None
+            and exposure_ctrl.baseline_brightness is not None):
         exp_slider = cv2.getTrackbarPos(SLIDER_EXPOSURE, CONTROLS_WIN)
         bri_slider = cv2.getTrackbarPos(SLIDER_BRIGHTNESS, CONTROLS_WIN)
 
@@ -978,6 +1383,23 @@ def main():
     exposure_ctrl = AutoExposureController()
     exposure_ctrl.set_baseline(cap)
     adaptive = AdaptiveThresholds()
+    tracker = LeafTracker(cfg.bbox_smooth_alpha, cfg.bbox_hold_frames)
+    prev_bbox = None  # last tracked box, fed back in as a continuity hint
+    exposure_mean_ema = None  # EMA of the exposure-driving brightness reading
+    gamma_mean_ema = None     # EMA of the gamma-driving brightness reading
+    frame_idx = 0
+    prev_leaf_found = False
+    frames_since_transition = cfg.brightness_transition_hold_frames  # start "settled"
+
+    refine_active = False
+    refine_frames_left = 0
+    refine_best_frame, refine_best_bbox, refine_best_score = None, None, -1.0
+
+    # Frozen "last real measurement" - reused during a brief bridged
+    # detection dropout (see LeafTracker hold_frames) so a 1-4 frame gap
+    # doesn't read as "no leaf" and doesn't reset stability/presence.
+    last_known_brightness = last_known_sharpness = last_known_vein_score = 0.0
+    last_known_area_ratio = 0.0
 
     window_name = "Leaf Capture System"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -1018,17 +1440,62 @@ def main():
         raw_frame = gray_world_white_balance(raw_frame)
 
         raw_gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
-        frame = auto_gamma_correct(raw_frame)
+        frame, raw_gamma_mean = auto_gamma_correct(raw_frame, smoothed_mean=gamma_mean_ema)
+        gamma_mean_ema = raw_gamma_mean if gamma_mean_ema is None else (
+            cfg.gamma_ema_alpha * raw_gamma_mean + (1 - cfg.gamma_ema_alpha) * gamma_mean_ema)
         display = frame.copy()
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        leaf_mask, bbox, area_ratio = detect_leaf(frame, cfg)
+        frame_idx += 1
+        # Switch hysteresis only kicks in once the SAME track has been
+        # confirmed over several consecutive frames (so an early bad lock
+        # can't reinforce itself), and is periodically forced off for one
+        # "cold" comparison so a better candidate elsewhere in frame can
+        # still win even against a long-held track. See detect_leaf().
+        was_confirmed = tracker.confirmed_frames >= cfg.continuity_min_confirmed_frames
+        cold_recheck = (frame_idx % cfg.cold_recheck_interval_frames == 0)
+        apply_hysteresis = was_confirmed and not cold_recheck
+
+        leaf_mask, bbox, area_ratio = detect_leaf(
+            frame, cfg, prev_bbox=prev_bbox, apply_hysteresis=apply_hysteresis)
         leaf_found = bbox is not None
+        # display_bbox is the smoothed/held box (see LeafTracker), fed back
+        # in as next frame's continuity hint.
+        display_bbox = tracker.update(bbox)
+        prev_bbox = display_bbox
+
+        # Once a track is confirmed, the smoothed/held box is trustworthy
+        # enough to drive MEASUREMENT and the SAVED crop too, not just the
+        # on-screen display - otherwise raw per-frame jitter still reaches
+        # the saved image even though the drawn box looks calm. Before
+        # confirmation, use the raw detection so a fresh lock isn't
+        # laggily smoothed away. The smoothed box is only trusted when it
+        # still substantially overlaps THIS frame's raw detection - if the
+        # two have diverged (e.g. the smoothed box is a stale lock on the
+        # wrong object), fall back to raw immediately rather than letting
+        # measurement/exposure keep chasing a stale region indefinitely.
+        track_confirmed = tracker.confirmed_frames >= cfg.continuity_min_confirmed_frames
+        smoothed_agrees = (display_bbox is not None and bbox is not None
+                            and _bbox_iou(display_bbox, bbox) > 0.3)
+        measurement_bbox = display_bbox if (track_confirmed and smoothed_agrees) else bbox
+        if measurement_bbox is None:
+            measurement_bbox = display_bbox  # bridged gap - use the held position for cropping
+
+        # leaf_present is broader than leaf_found: it stays True while the
+        # tracker is still HOLDING a box on screen (see LeafTracker
+        # hold_frames), bridging brief 1-4 frame detection dropouts (a
+        # momentary contour break, one noisy MJPG frame) that are normal
+        # and shouldn't read as "no leaf" or reset the stability/presence
+        # timers that gate auto-capture - previously they did, which is
+        # very likely why auto-capture rarely fired even with a leaf
+        # sitting still in frame for a long time.
+        leaf_present = display_bbox is not None
 
         # Exposure target: use the LEAF's own brightness (in the raw,
         # pre-gamma frame) when one is visible, whole-frame mean otherwise.
         if leaf_found:
-            x, y, w, h = bbox
+            assert measurement_bbox is not None
+            x, y, w, h = measurement_bbox
             x2b, y2b = min(x + w, raw_gray.shape[1]), min(y + h, raw_gray.shape[0])
             roi_raw = raw_gray[y:y2b, x:x2b]
             roi_mask_raw = leaf_mask[y:y2b, x:x2b]
@@ -1038,10 +1505,27 @@ def main():
                 exposure_mean = float(np.mean(raw_gray))
         else:
             exposure_mean = float(np.mean(raw_gray))
-        exposure_ctrl.maybe_adjust(cap, exposure_mean)
+
+        # The reading source flips between whole-frame and leaf-only ROI
+        # right on a found/not-found transition - use a slower EMA alpha
+        # for a short window after that flip so the jump itself is
+        # smoothed, not just ordinary per-frame noise (see A6 in Config).
+        if leaf_found != prev_leaf_found:
+            frames_since_transition = 0
+        else:
+            frames_since_transition += 1
+        prev_leaf_found = leaf_found
+        active_brightness_alpha = (cfg.brightness_transition_alpha
+                                    if frames_since_transition < cfg.brightness_transition_hold_frames
+                                    else cfg.brightness_ema_alpha)
+
+        exposure_mean_ema = exposure_mean if exposure_mean_ema is None else (
+            active_brightness_alpha * exposure_mean + (1 - active_brightness_alpha) * exposure_mean_ema)
+        exposure_ctrl.maybe_adjust(cap, exposure_mean_ema)
 
         if leaf_found and prev_gray_full is not None:
-            x, y, w, h = bbox
+            assert measurement_bbox is not None
+            x, y, w, h = measurement_bbox
             x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
             cur_roi_m = gray_full[y:y2, x:x2]
             prev_roi_m = prev_gray_full[y:y2, x:x2]
@@ -1051,6 +1535,12 @@ def main():
                 motion = float(np.mean(np.abs(cur_norm - prev_norm)))
             else:
                 motion = 999.0
+        elif leaf_present:
+            # Bridging a brief dropout - nothing physically moves
+            # meaningfully in a ~1-4 frame gap, so treat motion as
+            # negligible rather than the "definitely moving" fallback
+            # used for a genuine, sustained absence.
+            motion = 0.0
         else:
             motion = 999.0
         prev_gray_full = gray_full
@@ -1058,7 +1548,8 @@ def main():
         brightness = sharpness = vein_score = 0.0
 
         if leaf_found:
-            x, y, w, h = bbox
+            assert measurement_bbox is not None
+            x, y, w, h = measurement_bbox
             x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
             gray_roi = gray_full[y:y2, x:x2]
             roi_mask = leaf_mask[y:y2, x:x2]
@@ -1067,33 +1558,47 @@ def main():
             sharpness = compute_sharpness(gray_roi, roi_mask)
             vein_score = compute_vein_score(gray_roi, roi_mask)
 
-            # Bounding box is drawn unconditionally whenever a leaf is
-            # found - a thick outline, corner accents, and a label, so it
-            # can't be missed or blend into the background.
-            draw_leaf_bbox(display, bbox)
-
             if cfg.min_area_ratio <= area_ratio <= cfg.max_area_ratio \
                     and cfg.min_brightness <= brightness <= cfg.max_brightness:
                 adaptive.update(sharpness, vein_score, motion)
+
+            last_known_brightness, last_known_sharpness, last_known_vein_score = brightness, sharpness, vein_score
+            last_known_area_ratio = area_ratio
+        elif leaf_present:
+            # Reuse the last real measurement instead of zeroing out, so a
+            # brief bridged gap doesn't read as "no leaf" to guidance and
+            # doesn't reset the stability/presence tracking below.
+            brightness, sharpness, vein_score = last_known_brightness, last_known_sharpness, last_known_vein_score
+            area_ratio = last_known_area_ratio
+
+        # Bounding box is drawn from the smoothed/held box whenever one is
+        # available - a thick outline, corner accents, and a label, so it
+        # can't be missed or blend into the background, and doesn't visibly
+        # flicker on a one-frame detection dropout in clutter.
+        if display_bbox is not None:
+            draw_leaf_bbox(display, display_bbox)
 
         sharp_thresh = adaptive.sharp_target(cfg.sharpness_threshold)
         vein_thresh = adaptive.vein_target(cfg.vein_score_threshold)
         live_motion_threshold = adaptive.motion_target(cfg.motion_threshold)
 
         guidance_text, all_pass = decide_guidance(
-            cfg, area_ratio, brightness, sharpness, vein_score, leaf_found,
+            cfg, area_ratio, brightness, sharpness, vein_score, leaf_present,
             sharp_thresh, vein_thresh)
 
-        score = quality_score(cfg, area_ratio, brightness, sharpness, vein_score) if leaf_found else 0.0
+        score = quality_score(cfg, area_ratio, brightness, sharpness, vein_score) if leaf_present else 0.0
 
         now = time.time()
-        if leaf_found:
+        if leaf_present:
             if leaf_present_since is None:
+                # leaf_present just became True, which (see LeafTracker)
+                # can only happen off a genuine fresh detection, so
+                # leaf_found is guaranteed True here too.
                 leaf_present_since = now
                 captured_this_presence = False
-                presence_best_frame, presence_best_bbox, presence_best_score = frame.copy(), bbox, score
-            elif score > presence_best_score:
-                presence_best_frame, presence_best_bbox, presence_best_score = frame.copy(), bbox, score
+                presence_best_frame, presence_best_bbox, presence_best_score = frame.copy(), measurement_bbox, score
+            elif leaf_found and score > presence_best_score:
+                presence_best_frame, presence_best_bbox, presence_best_score = frame.copy(), measurement_bbox, score
         else:
             leaf_present_since = None
 
@@ -1101,44 +1606,67 @@ def main():
         stability_hist.append(steady_now)
         is_stable = len(stability_hist) == stability_hist.maxlen and all(stability_hist)
 
-        if is_stable and (now - last_capture_time) > cfg.capture_cooldown_sec:
-            # bbox here is the tight leaf box -> save_frame crops to just
-            # the leaf (plus a small margin), discarding the rest of the
-            # frame entirely.
-            save_frame(frame, cfg, score, bbox=bbox)
-            captures_count += 1
-            _beep()
-            last_capture_time = now
-            flash_until = now + cfg.capture_flash_sec
-            captured_this_presence = True
-            stability_hist.clear()
+        if refine_active:
+            # Stability window already completed once - keep evaluating a
+            # short extra stretch and bank whichever frame in it scores
+            # highest, rather than committing to the exact frame that
+            # happened to complete the streak (see Config.capture_refine_frames).
+            if steady_now:
+                if score > refine_best_score:
+                    refine_best_frame, refine_best_bbox, refine_best_score = frame.copy(), measurement_bbox, score
+                refine_frames_left -= 1
+                refine_done = refine_frames_left <= 0
+            else:
+                refine_done = True  # lost stability mid-window - bank the best seen so far
+            if refine_done:
+                save_frame(refine_best_frame, cfg, refine_best_score, bbox=refine_best_bbox)
+                captures_count += 1
+                _beep()
+                last_capture_time = now
+                flash_until = now + cfg.capture_flash_sec
+                captured_this_presence = True
+                stability_hist.clear()
+                refine_active = False
+        elif is_stable and (now - last_capture_time) > cfg.capture_cooldown_sec:
+            refine_active = True
+            refine_frames_left = cfg.capture_refine_frames
+            refine_best_frame, refine_best_bbox, refine_best_score = frame.copy(), measurement_bbox, score
         elif (leaf_present_since is not None and not captured_this_presence
               and (now - leaf_present_since) > cfg.capture_timeout_sec
               and presence_best_frame is not None):
             low_confidence = presence_best_score < cfg.low_confidence_score
-            save_frame(presence_best_frame, cfg, presence_best_score,
-                       bbox=presence_best_bbox, low_confidence=low_confidence)
-            captures_count += 1
-            _beep()
-            if low_confidence:
-                print("  note: best frame seen wasn't fully sharp - try holding the leaf a "
-                      "touch more still, or move it slowly to help the system find focus")
-            last_capture_time = now
-            flash_until = now + cfg.capture_flash_sec
-            captured_this_presence = True
-            stability_hist.clear()
+            if cfg.strict_reject_blurry and low_confidence:
+                print("  [timeout] best frame seen is still below the quality floor - "
+                      "continuing to wait instead of saving (strict_reject_blurry=True); "
+                      "try moving/refocusing the leaf")
+                leaf_present_since = now  # restart the timeout window rather than giving up
+            else:
+                save_frame(presence_best_frame, cfg, presence_best_score,
+                           bbox=presence_best_bbox, low_confidence=low_confidence)
+                captures_count += 1
+                _beep()
+                if low_confidence:
+                    print("  note: best frame seen wasn't fully sharp - try holding the leaf a "
+                          "touch more still, or move it slowly to help the system find focus")
+                last_capture_time = now
+                flash_until = now + cfg.capture_flash_sec
+                captured_this_presence = True
+                stability_hist.clear()
 
         if (now - last_status_print) > 1.0:
             ready_str = "learned" if adaptive.ready else f"learning ({len(adaptive.sharp_samples)}/{adaptive.min_samples})"
             mode_str = "MANUAL(locked)" if exposure_ctrl.manual_lock else (
                 "paused(key)" if exposure_ctrl.paused else "auto")
+            track_str = f"confirmed({tracker.confirmed_frames})" if track_confirmed else \
+                f"locking({tracker.confirmed_frames}/{cfg.continuity_min_confirmed_frames})"
+            refine_str = f" refining({refine_frames_left})" if refine_active else ""
             print(f"[status] guidance='{guidance_text}'  score={score:.1f}  "
                   f"sharp={sharpness:.0f}/{sharp_thresh:.0f}  vein={vein_score:.1f}/{vein_thresh:.1f}  "
-                  f"adaptive={ready_str}  mode={mode_str}  zoom={cfg.zoom_factor:.2f}x  "
-                  f"exposure={exposure_ctrl.last_status}")
+                  f"adaptive={ready_str}  mode={mode_str}  track={track_str}{refine_str}  "
+                  f"zoom={cfg.zoom_factor:.2f}x  exposure={exposure_ctrl.last_status}")
             last_status_print = now
 
-        draw_overlay(display, guidance_text, score, leaf_found,
+        draw_overlay(display, guidance_text, score, leaf_present,
                      len(stability_hist), stability_hist.maxlen,
                      captures_count, now < flash_until)
 
