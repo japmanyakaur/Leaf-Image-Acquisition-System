@@ -67,17 +67,30 @@ class Config:
     min_brightness: float = 70.0
     max_brightness: float = 205.0
 
-    # --- Generic fallback / hard floor. Adaptive thresholds are never
-    # allowed to relax below these, so a "learned" target can't end up
-    # laxer than a sane baseline. ---
+    # --- Generic fallback / hard floor. The LEARNED adaptive target is
+    # never allowed to relax below these on its own - but see
+    # quality_floor_relax_frac below, which progressively lowers this
+    # floor itself the longer a leaf sits present without a capture, so a
+    # floor that's simply uncalibrated for a given camera/lens (rather
+    # than a real "this frame is too blurry" case) can't block every
+    # single capture forever. ---
     sharpness_threshold: float = 90.0
     vein_score_threshold: float = 12.0
+    # By the time a leaf has been continuously present for
+    # capture_timeout_sec without a capture, the hard floor above has
+    # relaxed by this fraction (e.g. 0.4 = up to 40% lower). Ramps
+    # linearly from 0 (leaf just appeared - full strictness, favors a
+    # genuinely sharp capture if one is quickly achievable) up to this
+    # fraction (about to hit the no-quality-check timeout anyway, so a
+    # so-so-but-real "steady" capture here is strictly better than
+    # falling through to the timeout's single best-seen frame).
+    quality_floor_relax_frac: float = 0.4
 
     # --- Stability / autocapture behaviour ---
-    stability_frames_required: int = 15   # ~0.5s of "all checks pass"
+    stability_frames_required: int = 8    # ~0.25-0.3s of "all checks pass"
     motion_threshold: float = 4.0         # fallback only, before adaptive learns the real noise floor
     capture_cooldown_sec: float = 3.0
-    capture_timeout_sec: float = 9.0      # guarantee: save best-seen shot if "perfect" never hits this long
+    capture_timeout_sec: float = 5.0      # guarantee: save best-seen shot if "perfect" never hits this long
 
     # --- HSV range for green leaf segmentation. Kept fairly narrow to
     # TRUE greens on purpose: hue values below ~25 overlap skin tone, so a
@@ -105,6 +118,22 @@ class Config:
     # shadow bands) often do.
     leaf_aspect_min: float = 0.12
     leaf_aspect_max: float = 8.0
+    # Candidate SCORING saturates area's contribution at this fraction of
+    # the frame - a candidate at or beyond this size scores the same on
+    # the "size" term as one exactly at this ratio, it gets no further
+    # reward for being bigger still. Without this, area_ratio multiplies
+    # the score directly and unboundedly (up to the hard area ceiling
+    # below), so a large merged background+leaf blob will always
+    # out-score a smaller, more precisely-green true leaf just by being
+    # bigger - this is what let "most of the frame" win as "the leaf".
+    # Set to match the app's OWN "well-framed" zone (quality_score's
+    # optimal_low, ~min_area_ratio + 0.25*(max_area_ratio-min_area_ratio)
+    # =~ 0.15) - a leaf that size or larger is already "big enough",
+    # so it shouldn't need to keep growing (or fusing with background)
+    # to out-score a same-size-or-bigger competitor; once both are
+    # saturated, color/shape confidence alone decides, which reliably
+    # favors a clean leaf silhouette over a diluted merged blob.
+    leaf_size_score_saturation: float = 0.15
     # Switch hysteresis (see _pick_with_hysteresis): once a track exists,
     # a DIFFERENT candidate must score at least this fraction higher
     # before the detector switches to it - e.g. 0.2 means 20% better.
@@ -151,8 +180,8 @@ class Config:
     # Once the stability window first completes, keep evaluating for this
     # many extra frames and save the best-scoring one of them, instead of
     # whichever frame happened to complete the streak first.
-    capture_refine_frames: int = 6
-    # If True, the 9s timeout guarantee never saves a frame below
+    capture_refine_frames: int = 3
+    # If True, the timeout guarantee (capture_timeout_sec) never saves a frame below
     # low_confidence_score - it keeps waiting (and restarts its own timer)
     # instead. If False (default), it saves the best-seen frame anyway so
     # a photo is guaranteed, flagged "timeout"/low-confidence.
@@ -279,7 +308,7 @@ def _bbox_iou(a, b):
 
 
 def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, min_solidity=0.0,
-                       aspect_min=None, aspect_max=None, top_k=3):
+                       aspect_min=None, aspect_max=None, size_saturation_ratio=0.35, top_k=3):
     """Scores every plausible contour in `mask` on its own merits (size,
     color, shape only - no notion of tracking/continuity here, see
     detect_leaf's _pick_with_hysteresis for that) and returns the top_k
@@ -301,15 +330,25 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
         color differences compress toward zero as brightness drops.
 
     Scoring, for whatever survives the gates:
-      - base = area_ratio x (1 + color_margin factor) - bigger and more
-        confidently green scores higher.
+      - base = size_factor x (1 + color_margin factor) - size_factor is
+        area_ratio SATURATING at size_saturation_ratio (see
+        Config.leaf_size_score_saturation), not the raw ratio. A large
+        merged background+leaf blob and a well-framed true leaf that are
+        both at or beyond that saturation point score identically on
+        size - the blob no longer wins purely by being bigger.
       - x circularity factor (4*pi*area/perimeter^2, capped at 1.0) - real
         leaves are reasonably compact; jagged/branching clutter (mesh,
         cast shadows, wires) scores lower here even if it slipped past
         the solidity gate."""
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # A smaller, tighter close (and a separate, smaller open) than before -
+    # the previous 9x9/2-iteration close was aggressive enough to bridge
+    # small gaps between the true leaf and adjacent background pixels that
+    # only marginally passed the color threshold, FUSING them into one
+    # connected contour before scoring ever saw them as separate objects.
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -352,7 +391,8 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
         circularity = min((4.0 * np.pi * area) / (perimeter ** 2), 1.0) if perimeter > 0 else 0.0
         shape_factor = 0.5 + 0.5 * circularity
 
-        score = area_ratio * (1.0 + min(color_margin, 60.0) / 60.0) * shape_factor
+        size_factor = min(area_ratio / size_saturation_ratio, 1.0) if size_saturation_ratio > 0 else area_ratio
+        score = size_factor * (1.0 + min(color_margin, 60.0) / 60.0) * shape_factor
         candidates.append({"mask": candidate_mask, "bbox": (x, y, w, h),
                             "area_ratio": area_ratio, "score": score})
 
@@ -417,9 +457,15 @@ def detect_leaf(frame, cfg: Config, prev_bbox=None, apply_hysteresis=True):
     itself - hysteresis never overrides the color/shape gates, only which
     already-valid candidate wins.
 
-    Returns (mask_used_for_detection, bbox_or_None, area_ratio).
+    Returns (mask_used_for_detection, bbox_or_None, area_ratio, debug_info).
     mask_used_for_detection is always returned (even on failure) so the
-    caller can show it in the debug inset."""
+    caller can show it in the debug inset. debug_info is None when no
+    leaf was found, otherwise a dict with "score" (the winning
+    candidate's score), "raw_mask_fraction" (how much of the frame the
+    RAW per-pixel mask covers, before contour selection - see fix #5,
+    this is the number that reveals a mask that's over-including
+    background even when the SELECTED contour looks reasonable) and
+    "tier" (which detector stage won)."""
     frame_area = frame.shape[0] * frame.shape[1]
     hyst_bbox = prev_bbox if apply_hysteresis else None
 
@@ -429,14 +475,16 @@ def detect_leaf(frame, cfg: Config, prev_bbox=None, apply_hysteresis=True):
     # getting accepted as "the leaf". Set just above cfg.max_area_ratio
     # (the "too close, move away" guidance threshold) so a legitimately
     # large/close leaf still gets detected, but nowhere near "most of the
-    # frame" can ever pass.
-    max_candidate_ratio = min(cfg.max_area_ratio + 0.10, 0.65)
+    # frame" can ever pass. Tightened from +0.10/0.65 - that gave enough
+    # headroom for a background-merged blob to still sneak under the
+    # ceiling.
+    max_candidate_ratio = min(cfg.max_area_ratio + 0.05, 0.60)
 
     exg_mask = excess_green_mask(frame)
     exg_candidates = _score_candidates(frame, exg_mask, frame_area, max_ratio=max_candidate_ratio,
                                         min_ratio=0.003, min_solidity=0.28,
                                         aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
-                                        top_k=3)
+                                        size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3)
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower = np.array(cfg.hsv_lower, dtype=np.uint8)
@@ -445,28 +493,32 @@ def detect_leaf(frame, cfg: Config, prev_bbox=None, apply_hysteresis=True):
     hue_candidates = _score_candidates(frame, hue_mask, frame_area, max_ratio=max_candidate_ratio,
                                         min_ratio=0.003, min_solidity=0.28,
                                         aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
-                                        top_k=3)
+                                        size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3)
 
     pooled = exg_candidates + hue_candidates
     if pooled:
         winner = _pick_with_hysteresis(pooled, hyst_bbox, cfg.continuity_switch_margin)
-        return winner["mask"], winner["bbox"], winner["area_ratio"]
+        raw_frac = float(np.count_nonzero(cv2.bitwise_or(exg_mask, hue_mask))) / frame_area
+        debug_info = {"score": winner["score"], "raw_mask_fraction": raw_frac, "tier": "exg+hsv"}
+        return winner["mask"], winner["bbox"], winner["area_ratio"], debug_info
 
     bg_color = estimate_background_color(frame)
     bg_mask = background_diff_mask(frame, bg_color)
-    bg_candidates = _score_candidates(frame, bg_mask, frame_area, max_ratio=0.45,
+    bg_candidates = _score_candidates(frame, bg_mask, frame_area, max_ratio=0.40,
                                        min_ratio=0.003, min_solidity=0.30,
                                        aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
-                                       top_k=3)
+                                       size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3)
     if bg_candidates:
         winner = _pick_with_hysteresis(bg_candidates, hyst_bbox, cfg.continuity_switch_margin)
-        return winner["mask"], winner["bbox"], winner["area_ratio"]
+        raw_frac = float(np.count_nonzero(bg_mask)) / frame_area
+        debug_info = {"score": winner["score"], "raw_mask_fraction": raw_frac, "tier": "bg_diff"}
+        return winner["mask"], winner["bbox"], winner["area_ratio"], debug_info
 
     # Nothing passed validation - still hand back the combined raw masks
     # so the debug inset ('m' key) can show *why* nothing matched, instead
     # of a blank screen.
     combined = cv2.bitwise_or(exg_mask, cv2.bitwise_or(hue_mask, bg_mask))
-    return combined, None, 0.0
+    return combined, None, 0.0, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1281,6 +1333,41 @@ def draw_overlay(img, guidance_text, score, leaf_found, stable_count, stable_nee
                     1.0, COL_SUCCESS, 3, cv2.LINE_AA)
 
 
+def draw_debug_stats(display, mask_fraction, contour_fraction, exposure_brightness, score):
+    """Small text readout, directly above the debug mask inset ('m'
+    toggles both together): the four numbers that matter most for
+    diagnosing "is my mask eating the background" at a glance.
+      mask%     - how much of the FRAME the raw per-pixel detection mask
+                  covers, before any contour is picked. High here even
+                  when contour% looks reasonable is the first sign the
+                  color threshold itself is too inclusive.
+      contour%  - how much of the frame the SELECTED (winning) contour
+                  covers - this is what actually becomes the bounding
+                  box and the saved crop.
+      exposure  - the (decontaminated) brightness reading actually being
+                  fed to the auto-exposure controller this frame - watch
+                  this to see whether exposure hunting tracks a sane
+                  number or something contaminated/wrong.
+      score     - the winning candidate's raw score from
+                  _score_candidates, for comparing against what a
+                  competing candidate would have scored."""
+    lines = [
+        f"mask: {mask_fraction * 100:5.1f}%   contour: {contour_fraction * 100:5.1f}%",
+        f"exposure sample: {exposure_brightness:5.1f}   score: {score:5.2f}",
+    ]
+    h, w = display.shape[:2]
+    inset_h = 150  # matches draw_debug_mask_inset's inset_h - panel sits directly above it
+    panel_h = 24 * len(lines) + 12
+    x1, y1 = 16, h - inset_h - 16 - panel_h - 8
+    x2, y2 = x1 + 320, y1 + panel_h
+    overlay = display.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), COL_PANEL, -1)
+    cv2.addWeighted(overlay, 0.85, display, 0.15, 0, display)
+    for i, line in enumerate(lines):
+        cv2.putText(display, line, (x1 + 10, y1 + 24 * (i + 1)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, COL_TEXT_PRIMARY, 1, cv2.LINE_AA)
+
+
 def draw_debug_mask_inset(display, mask, leaf_found):
     """Small picture-in-picture of the raw detection mask, bottom-left
     corner. Toggle with 'm'. White = what the detector thinks is leaf.
@@ -1456,7 +1543,7 @@ def main():
         cold_recheck = (frame_idx % cfg.cold_recheck_interval_frames == 0)
         apply_hysteresis = was_confirmed and not cold_recheck
 
-        leaf_mask, bbox, area_ratio = detect_leaf(
+        leaf_mask, bbox, area_ratio, detect_debug = detect_leaf(
             frame, cfg, prev_bbox=prev_bbox, apply_hysteresis=apply_hysteresis)
         leaf_found = bbox is not None
         # display_bbox is the smoothed/held box (see LeafTracker), fed back
@@ -1493,6 +1580,23 @@ def main():
 
         # Exposure target: use the LEAF's own brightness (in the raw,
         # pre-gamma frame) when one is visible, whole-frame mean otherwise.
+        #
+        # Fix #4 (contaminated-mask exposure): if the "leaf" mask has
+        # fused in some background (see detect_leaf), a plain mean over
+        # every masked pixel bakes that contamination straight into the
+        # exposure target - a dark corner of background mixed in can
+        # read as "too dark" and drive exposure/gain up even while the
+        # actual leaf is fine or already blown out. Two independent
+        # guards against that:
+        #   1. Erode the mask before sampling - contamination is
+        #      concentrated at the boundary where a merged blob fused
+        #      with the background, so pixels solidly inside the
+        #      contour are far more likely to be genuine leaf.
+        #   2. Blend the masked reading toward the whole-frame reading
+        #      as area_ratio grows - a suspiciously large accepted
+        #      region is itself a contamination red flag (same signal
+        #      fix #1's size-saturated scoring reacts to), so it earns
+        #      less trust rather than being taken at face value.
         if leaf_found:
             assert measurement_bbox is not None
             x, y, w, h = measurement_bbox
@@ -1500,7 +1604,14 @@ def main():
             roi_raw = raw_gray[y:y2b, x:x2b]
             roi_mask_raw = leaf_mask[y:y2b, x:x2b]
             if roi_raw.size > 0 and np.any(roi_mask_raw):
-                exposure_mean = float(np.mean(roi_raw[roi_mask_raw > 0]))
+                erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                eroded_mask = cv2.erode(roi_mask_raw, erode_kernel, iterations=1)
+                sample_mask = eroded_mask if np.any(eroded_mask) else roi_mask_raw
+
+                masked_mean = float(np.mean(roi_raw[sample_mask > 0]))
+                whole_frame_mean = float(np.mean(raw_gray))
+                size_trust = 1.0 - 0.6 * min(area_ratio / cfg.max_area_ratio, 1.0)
+                exposure_mean = size_trust * masked_mean + (1.0 - size_trust) * whole_frame_mean
             else:
                 exposure_mean = float(np.mean(raw_gray))
         else:
@@ -1578,8 +1689,23 @@ def main():
         if display_bbox is not None:
             draw_leaf_bbox(display, display_bbox)
 
-        sharp_thresh = adaptive.sharp_target(cfg.sharpness_threshold)
-        vein_thresh = adaptive.vein_target(cfg.vein_score_threshold)
+        now = time.time()
+
+        # Progressive floor relaxation: the longer this leaf has sat
+        # present without a capture, the more the hard sharpness/vein
+        # floor eases off (see Config.quality_floor_relax_frac) - this
+        # keeps a floor that's simply uncalibrated for this camera/lens
+        # from permanently blocking every capture, without giving up
+        # quality checks immediately the way the hard timeout fallback
+        # does. A leaf that just appeared still gets the full, strict
+        # floor.
+        presence_elapsed = (now - leaf_present_since) if leaf_present_since is not None else 0.0
+        relax = min(presence_elapsed / cfg.capture_timeout_sec, 1.0)
+        sharp_floor = cfg.sharpness_threshold * (1.0 - cfg.quality_floor_relax_frac * relax)
+        vein_floor = cfg.vein_score_threshold * (1.0 - cfg.quality_floor_relax_frac * relax)
+
+        sharp_thresh = adaptive.sharp_target(sharp_floor)
+        vein_thresh = adaptive.vein_target(vein_floor)
         live_motion_threshold = adaptive.motion_target(cfg.motion_threshold)
 
         guidance_text, all_pass = decide_guidance(
@@ -1588,7 +1714,6 @@ def main():
 
         score = quality_score(cfg, area_ratio, brightness, sharpness, vein_score) if leaf_present else 0.0
 
-        now = time.time()
         if leaf_present:
             if leaf_present_since is None:
                 # leaf_present just became True, which (see LeafTracker)
@@ -1671,6 +1796,9 @@ def main():
                      captures_count, now < flash_until)
 
         if cfg.show_debug_mask:
+            debug_mask_fraction = detect_debug["raw_mask_fraction"] if detect_debug else 0.0
+            debug_score = detect_debug["score"] if detect_debug else 0.0
+            draw_debug_stats(display, debug_mask_fraction, area_ratio, exposure_mean_ema, debug_score)
             draw_debug_mask_inset(display, leaf_mask, leaf_found)
 
         cv2.imshow(window_name, display)
