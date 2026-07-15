@@ -43,6 +43,7 @@ import cv2
 import numpy as np
 import os
 import time
+import ctypes
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -805,8 +806,33 @@ def apply_digital_zoom(frame, zoom_factor):
 
 
 # --------------------------------------------------------------------------- #
-# Camera setup and automatic exposure control
+# Keyboard diagnostics - lets us confirm whether cv2.waitKey is actually
+# receiving keypresses at all, and which window is focused when it does.
+# waitKey only delivers a key to THIS process if an OpenCV HighGUI window
+# (not the console, not another app) has OS focus, so "q/s not working" is
+# very often just a focus problem rather than a bug in the key-handling
+# code below.
 # --------------------------------------------------------------------------- #
+
+def get_foreground_window_title():
+    """Best-effort title of whichever window currently has OS input focus.
+    Windows-only (uses ctypes/user32); returns None everywhere else or on
+    any failure, so callers should treat a None as "unknown", not "no
+    window focused"."""
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        length = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value
+    except Exception:
+        return None
+
 
 def open_camera(cfg: Config):
     backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
@@ -1972,6 +1998,7 @@ def main():
             ready_str = "learned" if adaptive.ready else f"learning ({len(adaptive.sharp_samples)}/{adaptive.min_samples})"
             mode_str = "MANUAL(locked)" if exposure_ctrl.manual_lock else (
                 "paused(key)" if exposure_ctrl.paused else "auto")
+            
             track_str = f"confirmed({tracker.confirmed_frames})" if track_confirmed else \
                 f"locking({tracker.confirmed_frames}/{cfg.continuity_min_confirmed_frames})"
             refine_str = f" refining({refine_frames_left})" if refine_active else ""
@@ -1993,6 +2020,11 @@ def main():
 
         cv2.imshow(window_name, display)
         key = cv2.waitKey(1) & 0xFF
+
+        if key != 0xFF:
+            focus_title = get_foreground_window_title()
+            char = chr(key) if 32 <= key < 127 else "?"
+            print(f"[keypress] raw_code={key} char={char!r} focus_window={focus_title!r}")
 
         if key == ord('q'):
             break
