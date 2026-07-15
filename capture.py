@@ -47,6 +47,20 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 
+# rembg is an OPTIONAL dependency used only for the one-shot capture-time
+# crop refinement (see refine_bbox_with_rembg) - never in the per-frame
+# live loop, since it's far too slow for that (see yolo_poc/ evaluation:
+# ~0.7-1.5 FPS vs ~9-10 FPS for the contour detector). If it isn't
+# installed, refinement is silently skipped and everything else in this
+# file behaves exactly as before.
+try:
+    from rembg import remove as _rembg_remove, new_session as _rembg_new_session
+    REMBG_AVAILABLE = True
+except ImportError:
+    _rembg_remove = None
+    _rembg_new_session = None
+    REMBG_AVAILABLE = False
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -78,19 +92,27 @@ class Config:
     vein_score_threshold: float = 12.0
     # By the time a leaf has been continuously present for
     # capture_timeout_sec without a capture, the hard floor above has
-    # relaxed by this fraction (e.g. 0.4 = up to 40% lower). Ramps
+    # relaxed by this fraction (e.g. 0.2 = up to 20% lower). Ramps
     # linearly from 0 (leaf just appeared - full strictness, favors a
     # genuinely sharp capture if one is quickly achievable) up to this
-    # fraction (about to hit the no-quality-check timeout anyway, so a
-    # so-so-but-real "steady" capture here is strictly better than
-    # falling through to the timeout's single best-seen frame).
-    quality_floor_relax_frac: float = 0.4
+    # fraction. Kept fairly small deliberately: this lens is fixed-focus
+    # (see AdaptiveThresholds), so a frame that's actually out of focus
+    # stays out of focus no matter how long you wait - relaxing the floor
+    # too far (0.4, previously) let genuinely blurry frames pass the
+    # AUTO/steady capture path instead of only ever reaching the visibly-
+    # tagged timeout fallback below.
+    quality_floor_relax_frac: float = 0.2
 
     # --- Stability / autocapture behaviour ---
     stability_frames_required: int = 8    # ~0.25-0.3s of "all checks pass"
     motion_threshold: float = 4.0         # fallback only, before adaptive learns the real noise floor
     capture_cooldown_sec: float = 3.0
-    capture_timeout_sec: float = 5.0      # guarantee: save best-seen shot if "perfect" never hits this long
+    # guarantee: save best-seen shot if "perfect" never hits this long.
+    # Longer than before (5.0) - this lens is fixed-focus, so finding the
+    # one real sharp distance takes the user a moment; cutting the window
+    # short pushed a capture out before a genuinely sharp frame had a
+    # chance to happen.
+    capture_timeout_sec: float = 8.0
 
     # --- HSV range for green leaf segmentation. Kept fairly narrow to
     # TRUE greens on purpose: hue values below ~25 overlap skin tone, so a
@@ -187,6 +209,49 @@ class Config:
     # a photo is guaranteed, flagged "timeout"/low-confidence.
     strict_reject_blurry: bool = False
 
+    # --- Capture-time crop refinement (rembg) ---
+    # rembg is class-agnostic salient-object segmentation - it doesn't
+    # know what a "leaf" is, just "the most visually prominent single
+    # foreground region", which our offline evaluation (yolo_poc/) showed
+    # handles cluttered backgrounds noticeably better than the contour
+    # method: 100% vs 89% detection rate across real test captures, and
+    # in several cases where the two disagreed, rembg was the one that
+    # got it right (the contour method had boxed a shadow or nearly the
+    # whole frame). It's far too slow to run every frame (~0.7-1.5 FPS),
+    # so it only runs ONCE, right before a photo is actually saved, to
+    # refine/validate the final crop - never in the live preview loop.
+    use_rembg_refinement: bool = True
+    rembg_model: str = "u2netp"   # lightweight variant - ~2x faster than u2net, same detection rate in testing
+    rembg_mask_thresh: int = 127
+    # rembg's box is only trusted over the contour method's if the region
+    # it picked is itself green-dominant (same gate _score_candidates
+    # uses) - guards against rembg confidently segmenting something that
+    # isn't the leaf at all (a hand, a reflection, a shadow), since it has
+    # no notion of "leaf" to begin with.
+    rembg_color_margin_floor: float = 1.3
+
+    # --- Live-preview tracker supervision (rembg) ---
+    # rembg's capture-time refinement above only fixes the FINAL saved
+    # crop - it says nothing about the box shown on screen while framing,
+    # which still comes entirely from the fast contour method and can
+    # still occasionally lock onto the wrong object (and, via switch
+    # hysteresis, keep defending that lock rather than self-correcting).
+    # Every rembg_live_recheck_interval_sec, consult rembg ONCE on the
+    # live frame and force-reseed the tracker if it disagrees with what's
+    # currently tracked (or if nothing is currently tracked at all).
+    #
+    # DEFAULTED OFF: live-tested and made detection noticeably worse - the
+    # tracker gets force-reset every 2s, but the next few frames of
+    # ordinary contour tracking (which runs WITHOUT hysteresis right after
+    # a reset, see detect_leaf/apply_hysteresis) can drag the smoothed box
+    # straight back toward whatever the contour method was already biased
+    # toward before the next correction lands, fighting itself rather than
+    # converging. The capture-time refinement above (use_rembg_refinement)
+    # was validated as a real improvement and is unaffected by this flag -
+    # only re-enable this one if you want to experiment further.
+    rembg_live_supervision: bool = False
+    rembg_live_recheck_interval_sec: float = 2.0
+
     # --- Debug ---
     show_debug_mask: bool = False
 
@@ -246,7 +311,7 @@ def excess_green_mask(frame):
     exg_u8 = np.clip(exg, 0, 255).astype(np.uint8)
     exg_blur = cv2.GaussianBlur(exg_u8, (5, 5), 0)
     otsu_val, _ = cv2.threshold(exg_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    inclusive_thresh = min(otsu_val, 16.0)
+    inclusive_thresh = min(otsu_val, 12.0)
     _, mask = cv2.threshold(exg_blur, inclusive_thresh, 255, cv2.THRESH_BINARY)
     return mask
 
@@ -384,7 +449,7 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
         color_margin = min(cg - cr, cg - cb)
         mean_luma = (cb + cg + cr) / 3.0
         relative_margin = color_margin / max(mean_luma, 1.0)
-        if color_margin <= 1.3 or relative_margin <= 0.04:
+        if color_margin <= 0.9 or relative_margin <= 0.022:
             continue  # not actually green-dominant - never let this win on size alone
 
         perimeter = cv2.arcLength(c, True)
@@ -1178,6 +1243,80 @@ def auto_gamma_correct(bgr, target_mean=140.0, tolerance=12.0, smoothed_mean=Non
 # Saving
 # --------------------------------------------------------------------------- #
 
+def create_rembg_session(cfg: Config):
+    """Call once at startup (never per-frame). Returns None - and prints
+    why - if rembg isn't installed or the model fails to load, in which
+    case refine_bbox_with_rembg() below becomes a no-op and every save
+    path silently falls back to the contour method's own bbox, exactly
+    like before this feature existed."""
+    if not cfg.use_rembg_refinement:
+        return None
+    if not REMBG_AVAILABLE:
+        print("  [rembg] package not installed - capture-time crop refinement disabled "
+              "(pip install \"rembg[cpu]\" to enable it). Everything else is unaffected.")
+        return None
+    assert _rembg_new_session is not None  # guaranteed by REMBG_AVAILABLE above
+    try:
+        session = _rembg_new_session(cfg.rembg_model)
+        print(f"  [rembg] crop refinement ready (model={cfg.rembg_model})")
+        return session
+    except Exception as e:
+        print(f"  [rembg] failed to load model ({e}) - crop refinement disabled")
+        return None
+
+
+def refine_bbox_with_rembg(frame_bgr, fallback_bbox, session, cfg: Config):
+    """Runs rembg ONCE on the frame being saved to get a class-agnostic
+    salient-object mask, and uses it in place of the contour method's
+    bbox if - and only if - what it found looks plausibly like the leaf
+    (green-dominant; see rembg_color_margin_floor). rembg has no notion
+    of "leaf" at all, so this plausibility gate is what stops it from
+    confidently handing back some other salient object in frame (a hand,
+    a reflection, a shadow) instead.
+
+    Only ever called at the moment of saving, not per-frame - this is
+    what keeps its ~0.7-1.5 FPS speed from touching the live preview.
+    Returns fallback_bbox unchanged if session is None (rembg unavailable
+    or disabled), if rembg finds nothing, or if what it found doesn't
+    pass the color-plausibility gate."""
+    if session is None:
+        return fallback_bbox
+    assert _rembg_remove is not None  # session is only ever non-None when rembg is available
+
+    try:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mask = _rembg_remove(rgb, session=session, only_mask=True)
+        # only_mask=True + an ndarray input always yields an ndarray at
+        # runtime - remove()'s declared return type is a broad Union
+        # because it also supports bytes/PIL-Image inputs/outputs.
+        assert isinstance(mask, np.ndarray)
+    except Exception as e:
+        print(f"  [rembg] refinement failed this capture ({e}) - using contour crop")
+        return fallback_bbox
+
+    _, binary = cv2.threshold(mask, cfg.rembg_mask_thresh, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return fallback_bbox
+
+    largest = max(contours, key=cv2.contourArea)
+    region_mask = np.zeros(mask.shape[:2], dtype=np.uint8)
+    cv2.drawContours(region_mask, [largest], -1, 255, thickness=cv2.FILLED)
+
+    means = _mean_bgr_in_mask(frame_bgr, region_mask)
+    if means is None:
+        return fallback_bbox
+    b, g, r = means
+    color_margin = min(g - r, g - b)
+    if color_margin <= cfg.rembg_color_margin_floor:
+        return fallback_bbox  # not green - don't trust it over the contour box
+
+    x, y, w, h = cv2.boundingRect(largest)
+    print(f"  [rembg] refined crop: ({x},{y},{w},{h})"
+          + (f"  (contour had {fallback_bbox})" if fallback_bbox is not None else "  (contour found nothing)"))
+    return (x, y, w, h)
+
+
 def _beep():
     """Best-effort audible capture cue - silently does nothing if the
     platform doesn't support it, since the visual flash is the primary
@@ -1252,6 +1391,23 @@ COL_BBOX = (0, 255, 60)
 
 def status_color(ok):
     return COL_SUCCESS if ok else COL_DANGER
+
+
+def show_refining_banner(display, window_name, msg="Refining crop..."):
+    """rembg (see refine_bbox_with_rembg, and the periodic live-tracker
+    supervision in main()) blocks for roughly 0.3-1.5s - long enough that
+    the preview would otherwise look frozen/hung. This draws a quick
+    banner and flushes it to screen BEFORE the blocking call, so the
+    pause reads as "the app is doing something" rather than "the app
+    broke"."""
+    banner = display.copy()
+    h, w = banner.shape[:2]
+    (mw, mh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2)
+    tx, ty = (w - mw) // 2, h // 2
+    cv2.rectangle(banner, (tx - 24, ty - mh - 18), (tx + mw + 24, ty + 16), (0, 0, 0), -1)
+    cv2.putText(banner, msg, (tx, ty), cv2.FONT_HERSHEY_DUPLEX, 0.9, COL_WARNING, 2, cv2.LINE_AA)
+    cv2.imshow(window_name, banner)
+    cv2.waitKey(1)
 
 
 def draw_leaf_bbox(img, bbox):
@@ -1469,6 +1625,8 @@ def main():
 
     exposure_ctrl = AutoExposureController()
     exposure_ctrl.set_baseline(cap)
+    rembg_session = create_rembg_session(cfg)
+    last_live_rembg_check = 0.0  # wall-clock time of the last periodic live-tracker supervision
     adaptive = AdaptiveThresholds()
     tracker = LeafTracker(cfg.bbox_smooth_alpha, cfg.bbox_hold_frames)
     prev_bbox = None  # last tracked box, fed back in as a continuity hint
@@ -1550,6 +1708,32 @@ def main():
         # in as next frame's continuity hint.
         display_bbox = tracker.update(bbox)
         prev_bbox = display_bbox
+
+        # Periodic live supervision (see Config.rembg_live_supervision):
+        # the fast contour tracker can lock onto the wrong object and then
+        # (via switch hysteresis) actively defend that lock instead of
+        # self-correcting. Every rembg_live_recheck_interval_sec, consult
+        # rembg once on THIS frame and force-reseed the tracker if it
+        # disagrees with what's currently shown on screen (or if nothing
+        # is currently tracked at all) - this is what fixes the on-screen
+        # box, not just the final saved crop (see refine_bbox_with_rembg,
+        # which only ever runs at the moment of saving).
+        rembg_check_now = time.time()
+        if (rembg_session is not None and cfg.rembg_live_supervision
+                and (rembg_check_now - last_live_rembg_check) > cfg.rembg_live_recheck_interval_sec):
+            last_live_rembg_check = rembg_check_now
+            show_refining_banner(display, window_name, msg="Verifying leaf lock...")
+            rembg_hint = refine_bbox_with_rembg(frame, None, rembg_session, cfg)
+            tracker_agrees = (display_bbox is not None and rembg_hint is not None
+                               and _bbox_iou(rembg_hint, display_bbox) > 0.3)
+            if rembg_hint is not None and not tracker_agrees:
+                print(f"  [rembg] live supervision: re-seeding tracker "
+                      f"(on-screen box was {display_bbox}, rembg says {rembg_hint})")
+                tracker.smoothed_bbox = None
+                tracker.confirmed_frames = 0
+                tracker.frames_since_seen = 0
+                display_bbox = tracker.update(rembg_hint)
+                prev_bbox = display_bbox
 
         # Once a track is confirmed, the smoothed/held box is trustworthy
         # enough to drive MEASUREMENT and the SAVED crop too, not just the
@@ -1744,7 +1928,10 @@ def main():
             else:
                 refine_done = True  # lost stability mid-window - bank the best seen so far
             if refine_done:
-                save_frame(refine_best_frame, cfg, refine_best_score, bbox=refine_best_bbox)
+                if rembg_session is not None:
+                    show_refining_banner(display, window_name)
+                final_bbox = refine_bbox_with_rembg(refine_best_frame, refine_best_bbox, rembg_session, cfg)
+                save_frame(refine_best_frame, cfg, refine_best_score, bbox=final_bbox)
                 captures_count += 1
                 _beep()
                 last_capture_time = now
@@ -1766,8 +1953,11 @@ def main():
                       "try moving/refocusing the leaf")
                 leaf_present_since = now  # restart the timeout window rather than giving up
             else:
+                if rembg_session is not None:
+                    show_refining_banner(display, window_name)
+                final_bbox = refine_bbox_with_rembg(presence_best_frame, presence_best_bbox, rembg_session, cfg)
                 save_frame(presence_best_frame, cfg, presence_best_score,
-                           bbox=presence_best_bbox, low_confidence=low_confidence)
+                           bbox=final_bbox, low_confidence=low_confidence)
                 captures_count += 1
                 _beep()
                 if low_confidence:
@@ -1807,7 +1997,10 @@ def main():
         if key == ord('q'):
             break
         elif key == ord('s'):
-            save_frame(frame, cfg, score, bbox=bbox, manual=True)
+            if rembg_session is not None:
+                show_refining_banner(display, window_name)
+            final_bbox = refine_bbox_with_rembg(frame, bbox, rembg_session, cfg)
+            save_frame(frame, cfg, score, bbox=final_bbox, manual=True)
             captures_count += 1
             _beep()
             flash_until = time.time() + cfg.capture_flash_sec
