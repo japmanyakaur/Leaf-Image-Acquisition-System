@@ -7,6 +7,15 @@
    under-exposed. Sharpness/vein "good enough" targets are learned live
    from what the camera actually sees as you move the leaf around.
 
+   AUTO-ZOOM: as soon as anything leaf-like is detected, the system pans
+   and zooms TOWARD it - narrowing the field of view onto the leaf and
+   cropping away background clutter (tripods, other objects) BEFORE
+   relying on the detector for anything else. It keeps adjusting until the
+   leaf is centered and at a good size, then stops and lets the normal
+   detection/quality/capture pipeline run on that now-clean, zoomed-in
+   view - the same as it always has. If the leaf is lost for a couple of
+   seconds, it resets back to a wide view and searches again.
+
 2. MANUAL OVERRIDE (secondary) - available two ways now:
      a) Keys i/k (exposure +/-) and o/l (brightness +/-) - a quick nudge
         that pauses automatic adjustment temporarily; it resumes on its
@@ -16,7 +25,10 @@
         "Auto Mode" toggle. Flipping the toggle to Manual (0) is a
         *persistent* lock - the sliders take direct control and it will
         NOT silently resume automatic like the key-nudges do. Flip it
-        back to Auto (1) to hand control back to the automatic loop.
+        back to Auto (1) to hand control back to the automatic loop. The
+        Zoom slider specifically only sticks while no leaf is currently
+        being tracked - once a leaf is found, auto-zoom takes over zoom/
+        pan for as long as it's tracked.
 
 Press 'm' to toggle a small debug inset showing the raw detection mask -
 useful if the bounding box ever seems to disappear, since it shows
@@ -33,7 +45,9 @@ CONTROLS (while a window is focused)
                           while Auto Mode = 0)
         Brightness     - direct brightness control (only takes effect
                           while Auto Mode = 0)
-        Zoom           - digital zoom, 100 = 1.0x ... 300 = 3.0x
+        Zoom           - digital zoom, 100 = 1.0x ... 300 = 3.0x (only
+                          sticks while no leaf is being tracked - auto-
+                          zoom takes over once one is found)
         Auto Mode      - 1 = automatic exposure (default), 0 = manual
                           (locks control to the Exposure/Brightness
                           sliders until switched back to 1)
@@ -115,6 +129,18 @@ class Config:
     # chance to happen.
     capture_timeout_sec: float = 8.0
 
+    # --- Fixed exclusion zone - the bottom strip of the frame is where
+    # THIS camera's own mount/tripod is physically visible in every single
+    # frame, regardless of scene content. No amount of color/shape gate
+    # tuning reliably rejects it every time (it's real hardware, not scene
+    # clutter, and can pick up enough of a color cast under some lighting
+    # to slip past the green/saturation/luma gates below) - but since it's
+    # a FIXED region that can never contain the leaf, it's far more robust
+    # to exclude it from detection entirely, before any color math runs at
+    # all. Set to comfortably cover the visible mount hardware; 0.0
+    # disables this (no region excluded). ---
+    ignore_bottom_frac: float = 0.22
+
     # --- HSV range for green leaf segmentation. Kept fairly narrow to
     # TRUE greens on purpose: hue values below ~25 overlap skin tone, so a
     # wide lower bound causes the detector to lock onto a hand/arm holding
@@ -133,6 +159,34 @@ class Config:
     zoom_factor: float = 1.0
     zoom_min: float = 1.0
     zoom_max: float = 3.0
+    # Current crop center as a fraction of the full frame (0-1). Owned by
+    # the auto-zoom logic in main() while a leaf is being tracked; reset
+    # to frame-center whenever the leaf is lost / nothing is being tracked.
+    pan_x: float = 0.5
+    pan_y: float = 0.5
+
+    # --- Auto-zoom: narrow the field of view onto the leaf BEFORE relying
+    # on it for anything else, so a wide/cluttered shot (background,
+    # tripod, other objects) gets cropped away and only a clean,
+    # leaf-dominated view ever reaches the detection/quality/capture logic
+    # below - the goal being "frame it like a human would before deciding
+    # anything about it looks like". ---
+    # Target area-ratio band to zoom toward - matches quality_score's own
+    # "optimal" framing band (min_area_ratio + 0.25..0.65 of the range),
+    # so "well framed by auto-zoom" and "scores well" can't disagree.
+    auto_zoom_target_low: float = 0.15
+    auto_zoom_target_high: float = 0.35
+    # How far off-center (as a fraction of frame width/height) the leaf
+    # may be before auto-zoom is considered "aimed" and allowed to zoom
+    # further; while off-center by more than this, panning takes priority
+    # over zooming so an off-center leaf doesn't get cropped out of frame.
+    auto_zoom_center_tol: float = 0.10
+    auto_zoom_step: float = 0.04        # zoom_factor change per frame
+    auto_pan_step: float = 0.06         # max pan-fraction shift per frame
+    # If the leaf has been missing this long, give up and reset back to a
+    # neutral wide view to search again, rather than staying zoomed in on
+    # empty space.
+    auto_zoom_lost_reset_sec: float = 2.0
 
     # --- Cluttered-background robustness ---
     # Candidate contours whose w/h ratio falls outside this range are
@@ -374,7 +428,8 @@ def _bbox_iou(a, b):
 
 
 def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, min_solidity=0.0,
-                       aspect_min=None, aspect_max=None, size_saturation_ratio=0.35, top_k=3):
+                       aspect_min=None, aspect_max=None, size_saturation_ratio=0.35, top_k=3,
+                       debug=False, debug_label=""):
     """Scores every plausible contour in `mask` on its own merits (size,
     color, shape only - no notion of tracking/continuity here, see
     detect_leaf's _pick_with_hysteresis for that) and returns the top_k
@@ -388,12 +443,35 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
       - area_ratio must fall within [min_ratio, max_ratio].
       - aspect_min/aspect_max reject thin slivers (mesh wire, table seam,
         shadow band) - real leaves don't come that elongated.
+      - a candidate touching 3+ of the 4 frame edges is rejected outright,
+        regardless of area_ratio - background, or several objects merged
+        into one blob, not an isolated leaf.
       - min_solidity rejects rough/jagged/branching blobs.
       - color margin (green minus red/blue) must be green-dominant, with
         BOTH an absolute floor and a floor relative to the candidate's own
         brightness. A fixed absolute cutoff alone under-rejects noise in
         bright scenes and over-rejects real leaves in dim ones, since raw
         color differences compress toward zero as brightness drops.
+      - a per-pixel green_fraction check: at least 55% of the candidate's
+        OWN pixels must individually clear a green-dominance floor, not
+        just the region's mean. This is what actually rejects a MERGED
+        blob (a real leaf fused by morphological close with an adjacent
+        swath of weakly-green background, e.g. a wood table) - the mean
+        color-margin check above can still pass a merged blob if the real
+        leaf pixels alone drag its average past the floor, even though
+        most of the blob's area isn't leaf. Confirmed via debug output
+        (see detect_leaf's debug=True path) that this was letting a large
+        merged blob outscore the correctly-shaped, correctly-positioned
+        real leaf candidate purely on size.
+      - an explicit minimum LUMA rejects genuinely dark/black objects
+        directly by how dark they are, rather than relying on color-margin
+        math alone (noisy in dark regions).
+      - an explicit minimum SATURATION additionally rejects achromatic
+        objects even when auto_gamma_correct's brightness scaling has
+        pushed their luma up (scaling all channels equally changes luma
+        but not hue/saturation, so saturation stays a reliable "is this
+        actually colored" signal even during an under/over-exposure
+        hunting phase where luma alone can be misleading).
 
     Scoring, for whatever survives the gates:
       - base = size_factor x (1 + color_margin factor) - size_factor is
@@ -418,26 +496,57 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
+        if debug:
+            print(f"    [{debug_label}] 0 raw contours in mask")
         return []
+
+    # Computed once per call (not per-candidate) - saturation is the S
+    # channel of HSV, sampled per-candidate below.
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask_h, mask_w = mask.shape[:2]
+    edge_margin_x = max(int(mask_w * 0.02), 2)
+    edge_margin_y = max(int(mask_h * 0.02), 2)
+
+    # Per-gate rejection counters - printed as a summary when debug=True
+    # (see Config.show_debug_mask / the 'm' key) so it's directly visible
+    # HOW MANY contours existed, and exactly which gate rejected each one
+    # that didn't survive, rather than only ever seeing the final winner.
+    rejected = {"area_ratio": 0, "aspect": 0, "border_touch": 0,
+                "solidity": 0, "luma": 0, "color_margin": 0, "mixed_region": 0, "saturation": 0}
 
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
         area_ratio = area / frame_area
         if area_ratio < min_ratio or area_ratio > max_ratio:
+            rejected["area_ratio"] += 1
             continue
 
         x, y, w, h = cv2.boundingRect(c)
         if aspect_min is not None and aspect_max is not None and h > 0:
             aspect = w / h
             if aspect < aspect_min or aspect > aspect_max:
+                rejected["aspect"] += 1
                 continue  # too sliver-like to plausibly be a leaf
+
+        # A candidate touching 3+ of the 4 frame edges spans nearly the
+        # whole frame - background, or several objects merged into one
+        # blob, not an isolated leaf. area_ratio alone can't tell "large
+        # but isolated" from "spans edge to edge"; this geometric check
+        # can, and it's exactly what a "very big box covering the leaf and
+        # other objects" looks like.
+        touches = ((x <= edge_margin_x) + (x + w >= mask_w - edge_margin_x)
+                   + (y <= edge_margin_y) + (y + h >= mask_h - edge_margin_y))
+        if touches >= 3:
+            rejected["border_touch"] += 1
+            continue
 
         if min_solidity > 0:
             hull = cv2.convexHull(c)
             hull_area = cv2.contourArea(hull)
             solidity = area / hull_area if hull_area > 1e-6 else 0.0
             if solidity < min_solidity:
+                rejected["solidity"] += 1
                 continue
 
         candidate_mask = np.zeros(mask.shape, dtype=np.uint8)
@@ -449,9 +558,72 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
         cb, cg, cr = means
         color_margin = min(cg - cr, cg - cb)
         mean_luma = (cb + cg + cr) / 3.0
+        if mean_luma < 35.0:
+            # Explicit brightness floor - a genuinely dark/black object (a
+            # cable, a clip, a shadow, a tripod/camera part) is rejected
+            # directly by HOW DARK IT IS, rather than relying solely on
+            # the color-margin math below. Dark, low-signal image regions
+            # are noisy (more so once amplified by sensor gain), so a
+            # near-black object's per-pixel color can average out to a
+            # small but non-zero green margin by pure chance even though
+            # it obviously isn't a leaf - this is what let dark objects
+            # get accepted as "the leaf" with the color-margin gate alone.
+            rejected["luma"] += 1
+            continue
         relative_margin = color_margin / max(mean_luma, 1.0)
-        if color_margin <= 0.9 or relative_margin <= 0.022:
+        if color_margin <= 4.0 or relative_margin <= 0.04:
+            # Tightened from 0.9/0.022 - that was loose enough to let
+            # objects with only a faint greenish cast (ambient color cast,
+            # slight sensor noise) clear the bar and be accepted as "the
+            # leaf" just for being the biggest/only candidate around.
+            rejected["color_margin"] += 1
             continue  # not actually green-dominant - never let this win on size alone
+
+        # PER-PIXEL uniformity check - color_margin/relative_margin above
+        # only look at the MEAN color of the whole candidate, which a
+        # MERGED region (a real leaf fused by morphological close with an
+        # adjacent swath of weakly-green background - e.g. a wood table
+        # under lighting where ExG's own deliberately-inclusive threshold
+        # reads it as faintly green) can still pass even though most of
+        # its area isn't leaf at all: the real leaf pixels alone can drag
+        # the average past every mean-based floor above. Confirmed via
+        # debug output: a ~20%-of-frame merged blob outscored the actual,
+        # correctly-shaped, correctly-positioned leaf candidate sitting
+        # right next to it purely because size_factor rewards its bulk -
+        # tightening the MEAN gates further can't fix that, since the
+        # problem isn't "the average is slightly off", it's "the average
+        # is computed over a mostly-non-leaf region". Requiring a HIGH
+        # FRACTION of the candidate's own pixels to individually clear a
+        # green-dominance floor (not just the region's mean) directly
+        # rejects a mostly-background blob regardless of how its average
+        # happens to work out, while a genuine, solid leaf easily passes
+        # since nearly all of its pixels are actually green.
+        region_pixels = frame[candidate_mask > 0].astype(np.float32)
+        region_margin = np.minimum(region_pixels[:, 1] - region_pixels[:, 2],
+                                    region_pixels[:, 1] - region_pixels[:, 0])
+        green_fraction = float(np.mean(region_margin > 3.0))
+        if green_fraction < 0.55:
+            rejected["mixed_region"] += 1
+            continue
+
+        sat_values = hsv_frame[:, :, 1][candidate_mask > 0]
+        if sat_values.size == 0 or float(np.mean(sat_values)) < 25.0:
+            # Saturation is a MORE ROBUST signal than the luma floor above
+            # against one specific failure mode: auto_gamma_correct applies
+            # a uniform multiplicative brightness scale to the whole frame
+            # BEFORE detection ever runs - multiplying all three (B,G,R)
+            # channels by the same factor changes luma but leaves hue/
+            # saturation exactly unchanged (mathematically: scaling all
+            # channels equally preserves their ratios). So during an
+            # underexposed stretch, gamma correction's brightening can push
+            # a genuinely black/achromatic object's LUMA up past the floor
+            # above, while its saturation - correctly reflecting that it
+            # has no real color - stays low regardless. This is what let a
+            # "black object" slip through the luma floor during exactly
+            # the early under/over-exposure hunting phase where it matters
+            # most.
+            rejected["saturation"] += 1
+            continue
 
         perimeter = cv2.arcLength(c, True)
         circularity = min((4.0 * np.pi * area) / (perimeter ** 2), 1.0) if perimeter > 0 else 0.0
@@ -463,6 +635,12 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
                             "area_ratio": area_ratio, "score": score})
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
+    if debug:
+        survived = len(candidates)
+        top = candidates[0]["bbox"] if candidates else None
+        top_score = candidates[0]["score"] if candidates else None
+        print(f"    [{debug_label}] {len(contours)} raw contours -> {survived} survived all gates "
+              f"(rejected: {rejected}) -> top candidate bbox={top} score={top_score}")
     return candidates[:top_k]
 
 
@@ -490,8 +668,14 @@ def _pick_with_hysteresis(candidates, prev_bbox, switch_margin, min_iou=0.15):
     return best  # genuinely better - allow the switch
 
 
-def detect_leaf(frame, cfg: Config, prev_bbox=None, apply_hysteresis=True):
+def detect_leaf(frame, cfg: Config, prev_bbox=None, apply_hysteresis=True, debug=False):
     """Detection order:
+
+    0. Config.ignore_bottom_frac blanks out a fixed strip at the bottom of
+       every mask before anything else runs - this camera's own mount/
+       tripod is physically visible there in every frame, and no color/
+       shape gate reliably rejects real hardware every single time, so it
+       is excluded at the source instead.
 
     1. Excess-green (ExG) segmentation - the primary detector. Robust to
        background AND to skin tone, since it reasons about green-channel
@@ -546,39 +730,88 @@ def detect_leaf(frame, cfg: Config, prev_bbox=None, apply_hysteresis=True):
     # ceiling.
     max_candidate_ratio = min(cfg.max_area_ratio + 0.05, 0.60)
 
-    exg_mask = excess_green_mask(frame)
+    # Blank out the fixed exclusion zone (see Config.ignore_bottom_frac)
+    # in EVERY mask before any contour is ever extracted from it - the
+    # camera's own mount/tripod, physically visible in the same region of
+    # every frame, can never contain the leaf, so it's excluded at the
+    # source rather than relying on color/shape gates to reject it anew
+    # every single frame.
+    frame_h, frame_w = frame.shape[:2]
+    roi_mask = np.full((frame_h, frame_w), 255, dtype=np.uint8)
+    cutoff = frame_h
+    if cfg.ignore_bottom_frac > 0:
+        cutoff = int(frame_h * (1.0 - cfg.ignore_bottom_frac))
+        roi_mask[cutoff:, :] = 0
+
+    raw_exg = excess_green_mask(frame)
+    exg_mask = cv2.bitwise_and(raw_exg, roi_mask)
+    raw_hsv_for_exclusion = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower = np.array(cfg.hsv_lower, dtype=np.uint8)
+    upper = np.array(cfg.hsv_upper, dtype=np.uint8)
+    raw_hue = cv2.inRange(raw_hsv_for_exclusion, lower, upper)
+    hue_mask = cv2.bitwise_and(raw_hue, roi_mask)
+
+    if debug:
+        # Direct, falsifiable proof the exclusion zone is removing real
+        # foreground pixels (not just a visual overlay) - counts pixels
+        # that WOULD have been foreground in the excluded strip, per mask,
+        # before roi_mask zeroed them out.
+        if cfg.ignore_bottom_frac > 0:
+            exg_excluded = int(np.count_nonzero(raw_exg[cutoff:, :]))
+            hue_excluded = int(np.count_nonzero(raw_hue[cutoff:, :]))
+        else:
+            exg_excluded = hue_excluded = 0
+        print(f"  [exclusion] cutoff_y={cutoff}/{frame_h} ({cfg.ignore_bottom_frac*100:.0f}% of frame) "
+              f"exg_pixels_removed={exg_excluded}  hue_pixels_removed={hue_excluded}")
+
     exg_candidates = _score_candidates(frame, exg_mask, frame_area, max_ratio=max_candidate_ratio,
                                         min_ratio=0.003, min_solidity=0.28,
                                         aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
-                                        size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3)
+                                        size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3,
+                                        debug=debug, debug_label="exg")
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower = np.array(cfg.hsv_lower, dtype=np.uint8)
-    upper = np.array(cfg.hsv_upper, dtype=np.uint8)
-    hue_mask = cv2.inRange(hsv, lower, upper)
     hue_candidates = _score_candidates(frame, hue_mask, frame_area, max_ratio=max_candidate_ratio,
                                         min_ratio=0.003, min_solidity=0.28,
                                         aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
-                                        size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3)
+                                        size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3,
+                                        debug=debug, debug_label="hue")
 
     pooled = exg_candidates + hue_candidates
     if pooled:
         winner = _pick_with_hysteresis(pooled, hyst_bbox, cfg.continuity_switch_margin)
         raw_frac = float(np.count_nonzero(cv2.bitwise_or(exg_mask, hue_mask))) / frame_area
         debug_info = {"score": winner["score"], "raw_mask_fraction": raw_frac, "tier": "exg+hsv"}
+        if debug:
+            wx, wy, ww, wh = winner["bbox"]
+            print(f"  [detect_leaf] SELECTED tier=exg+hsv bbox=({wx},{wy},{ww},{wh}) "
+                  f"bottom_edge_y={wy + wh} vs cutoff_y={cutoff} "
+                  f"score={winner['score']:.2f} area_ratio={winner['area_ratio']:.4f}")
         return winner["mask"], winner["bbox"], winner["area_ratio"], debug_info
 
     bg_color = estimate_background_color(frame)
-    bg_mask = background_diff_mask(frame, bg_color)
+    raw_bg = background_diff_mask(frame, bg_color)
+    bg_mask = cv2.bitwise_and(raw_bg, roi_mask)
+    if debug:
+        bg_excluded = int(np.count_nonzero(raw_bg[cutoff:, :])) if cfg.ignore_bottom_frac > 0 else 0
+        print(f"  [exclusion] bg_diff tier: bg_pixels_removed={bg_excluded}")
     bg_candidates = _score_candidates(frame, bg_mask, frame_area, max_ratio=0.40,
                                        min_ratio=0.003, min_solidity=0.30,
                                        aspect_min=cfg.leaf_aspect_min, aspect_max=cfg.leaf_aspect_max,
-                                       size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3)
+                                       size_saturation_ratio=cfg.leaf_size_score_saturation, top_k=3,
+                                       debug=debug, debug_label="bg_diff")
     if bg_candidates:
         winner = _pick_with_hysteresis(bg_candidates, hyst_bbox, cfg.continuity_switch_margin)
         raw_frac = float(np.count_nonzero(bg_mask)) / frame_area
         debug_info = {"score": winner["score"], "raw_mask_fraction": raw_frac, "tier": "bg_diff"}
+        if debug:
+            wx, wy, ww, wh = winner["bbox"]
+            print(f"  [detect_leaf] SELECTED tier=bg_diff bbox=({wx},{wy},{ww},{wh}) "
+                  f"bottom_edge_y={wy + wh} vs cutoff_y={cutoff} "
+                  f"score={winner['score']:.2f} area_ratio={winner['area_ratio']:.4f}")
         return winner["mask"], winner["bbox"], winner["area_ratio"], debug_info
+
+    if debug:
+        print("  [detect_leaf] NO candidate survived any tier this frame")
 
     # Nothing passed validation - still hand back the combined raw masks
     # so the debug inset ('m' key) can show *why* nothing matched, instead
@@ -794,13 +1027,19 @@ def quality_score(cfg: Config, area_ratio, brightness, sharpness, vein_score):
 # with everything downstream (nothing else needs to know zoom happened).
 # --------------------------------------------------------------------------- #
 
-def apply_digital_zoom(frame, zoom_factor):
+def apply_digital_zoom(frame, zoom_factor, center_x=0.5, center_y=0.5):
+    """center_x/center_y (fractions of the full frame, 0-1) let the crop
+    follow a subject instead of always being centered on the frame - this
+    is what lets auto-zoom pan TOWARD the leaf as it zooms in, rather than
+    zooming in place and potentially cropping an off-center leaf out of
+    frame entirely."""
     if zoom_factor <= 1.001:
         return frame
     h, w = frame.shape[:2]
     crop_w, crop_h = int(w / zoom_factor), int(h / zoom_factor)
-    x1 = (w - crop_w) // 2
-    y1 = (h - crop_h) // 2
+    cx, cy = int(w * center_x), int(h * center_y)
+    x1 = max(0, min(cx - crop_w // 2, w - crop_w))
+    y1 = max(0, min(cy - crop_h // 2, h - crop_h))
     cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
@@ -957,6 +1196,10 @@ class AutoExposureController:
         self._white_frame_streak = 0
         self._error_integral = 0.0
         self._pinned_checks = {"exposure": 0, "gain": 0, "brightness": 0}
+        self._auto_exposure_manual_value = None  # whichever convention (0.25 or 1) actually worked
+        self._last_manual_reassert = 0.0
+        self._ae_readback_reliable = True  # set for real in set_baseline()
+        self._last_observed_ae = None
 
     def _probe_support(self, cap, prop, test_delta, epsilon):
         """Small deliberate change + readback to find out whether this
@@ -1012,9 +1255,30 @@ class AutoExposureController:
         actually change - and records the current exposure/gain/brightness
         as the safe anchor all later adjustments are bounded around."""
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)   # DirectShow convention: 0.25 = manual
+        self._auto_exposure_manual_value = 0.25
         if cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) not in (0.25,):
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # V4L2 convention: 1 = manual
-        print(f"  AUTO_EXPOSURE after manual-mode request: {cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)}")
+            self._auto_exposure_manual_value = 1
+        ae_readback = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        print(f"  AUTO_EXPOSURE after manual-mode request: {ae_readback}")
+        # Some drivers (seen on this project: DirectShow reporting -1
+        # regardless of what's written) never confirm ANY value via
+        # readback at all - readback isn't just "different", it's simply
+        # not meaningful for this property on this driver. Detecting that
+        # UP FRONT (rather than treating every future mismatch as "the
+        # firmware reverted to auto") is what stops the periodic recheck
+        # below from printing a false "reverted to auto mode" warning
+        # every single check forever when nothing has actually changed -
+        # that misleading noise was previously indistinguishable from a
+        # genuine reversion event.
+        self._ae_readback_reliable = abs(ae_readback - self._auto_exposure_manual_value) < 0.01
+        self._last_observed_ae = ae_readback
+        if not self._ae_readback_reliable:
+            print("  NOTE: AUTO_EXPOSURE readback doesn't confirm manual mode on this driver "
+                  "(common/harmless on some DirectShow webcams) - EXPOSURE/BRIGHTNESS writes "
+                  "are what actually matter and are verified separately below; the periodic "
+                  "re-assertion will keep writing this property defensively but won't warn "
+                  "about it since this driver's readback isn't a reliable signal either way.")
 
         self.exposure_supported, self.baseline_exposure = self._probe_support(
             cap, cv2.CAP_PROP_EXPOSURE, 1.0, 0.05)
@@ -1136,6 +1400,44 @@ class AutoExposureController:
         self.manual_lock = False
 
     def maybe_adjust(self, cap, mean_brightness: float):
+        # Some UVC webcam drivers silently revert CAP_PROP_AUTO_EXPOSURE
+        # back to their OWN firmware auto-exposure after a while (or after
+        # certain events), even though set_baseline() forced it to manual
+        # once at startup. When that happens, the camera's own auto
+        # exposure fights whatever this loop - or the manual Exposure/
+        # Brightness sliders - try to set, and exposure can drift/stay too
+        # bright no matter what the software does; this was never
+        # re-checked after startup. Re-asserting the same manual value
+        # periodically (BEFORE the manual_lock/paused checks below - the
+        # sliders need this forced too, to have any real effect at all) is
+        # a cheap, harmless guard, and prints clearly whenever it actually
+        # had to correct something, so this failure mode is directly
+        # diagnosable instead of just looking like "the software logic is
+        # broken".
+        if self._auto_exposure_manual_value is not None:
+            recheck_now = time.time()
+            if (recheck_now - self._last_manual_reassert) > 3.0:
+                self._last_manual_reassert = recheck_now
+                current_ae = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                # Only warn on a genuine TRANSITION (compared to the last
+                # OBSERVED reading, not the originally-requested value) -
+                # on drivers where readback never confirmed the manual
+                # value in the first place (see set_baseline's
+                # _ae_readback_reliable), every check would otherwise
+                # "mismatch" forever and print a false "reverted to auto"
+                # warning every single cycle even though nothing ever
+                # actually changed. Still write the value defensively
+                # either way - harmless, and a real safety net on drivers
+                # where readback DOES work.
+                if (self._ae_readback_reliable and self._last_observed_ae is not None
+                        and abs(current_ae - self._last_observed_ae) > 0.01
+                        and abs(current_ae - self._auto_exposure_manual_value) > 0.01):
+                    print(f"  [exposure] AUTO_EXPOSURE changed to {current_ae:.2f} "
+                          f"(expected {self._auto_exposure_manual_value:.2f}) - camera "
+                          f"firmware likely reverted to its own auto mode; re-asserting manual.")
+                self._last_observed_ae = current_ae
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, self._auto_exposure_manual_value)
+
         if self.manual_lock:
             # Fully hands-off: the Controls sliders are driving exposure/
             # brightness directly elsewhere in the main loop.
@@ -1200,26 +1502,33 @@ class AutoExposureController:
         direction = 1.0 if combined >= 0 else -1.0
         step_frac = min(abs(combined), self.max_step)
 
+        exposure_step = step_frac * self.exposure_max_drift * self.exposure_step_frac
+        gain_step = step_frac * self.gain_max_drift * self.gain_step_frac
+        brightness_step = step_frac * self.brightness_max_drift * self.brightness_step_frac
         moved = False
-        if self.exposure_supported:
+
+        # BUG FIX: gain was previously only ever RAISED (direction > 0),
+        # never lowered - so if gain had been pushed up at any point (a
+        # dim room, a startup default), there was no code path that ever
+        # brought it back down again once the scene needed to be darker.
+        # That's a direct, concrete cause of "exposure stays too high":
+        # gain keeps amplifying the signal regardless of what exposure/
+        # brightness are doing. Tried FIRST when darkening (lowering gain
+        # has no image-quality downside, unlike raising it, so there's no
+        # reason to prefer exposure/shutter here the way there is when
+        # brightening).
+        if direction < 0 and self.gain_supported:
+            moved, _ = self._adjust_property(cap, cv2.CAP_PROP_GAIN, direction, gain_step, "gain")
+
+        if not moved and self.exposure_supported:
             moved, _ = self._adjust_property(
-                cap, cv2.CAP_PROP_EXPOSURE, direction,
-                step_frac * self.exposure_max_drift * self.exposure_step_frac, "exposure")
+                cap, cv2.CAP_PROP_EXPOSURE, direction, exposure_step, "exposure")
 
         if not moved and direction > 0 and self.gain_supported:
-            self._adjust_property(
-                cap, cv2.CAP_PROP_GAIN, direction,
-                step_frac * self.gain_max_drift * self.gain_step_frac, "gain")
-        elif not moved and direction < 0 and self.brightness_supported:
-            self._adjust_property(
-                cap, cv2.CAP_PROP_BRIGHTNESS, direction,
-                step_frac * self.brightness_max_drift * self.brightness_step_frac, "brightness")
-        elif moved and self.brightness_supported:
-            # Exposure alone is handling most of the correction - a small
-            # brightness nudge in the same direction speeds convergence.
-            self._adjust_property(
-                cap, cv2.CAP_PROP_BRIGHTNESS, direction,
-                step_frac * self.brightness_max_drift * self.brightness_step_frac * 0.5, "brightness")
+            moved, _ = self._adjust_property(cap, cv2.CAP_PROP_GAIN, direction, gain_step, "gain")
+
+        if not moved and self.brightness_supported:
+            self._adjust_property(cap, cv2.CAP_PROP_BRIGHTNESS, direction, brightness_step, "brightness")
 
         word = "raising" if direction > 0 else "lowering"
         self.last_status = f"{word} (leaf mean {mean:.0f})"
@@ -1656,6 +1965,7 @@ def main():
     adaptive = AdaptiveThresholds()
     tracker = LeafTracker(cfg.bbox_smooth_alpha, cfg.bbox_hold_frames)
     prev_bbox = None  # last tracked box, fed back in as a continuity hint
+    zoom_lost_since = None  # wall-clock time the leaf was last seen, for auto-zoom's reset-to-wide-view
     exposure_mean_ema = None  # EMA of the exposure-driving brightness reading
     gamma_mean_ema = None     # EMA of the gamma-driving brightness reading
     frame_idx = 0
@@ -1704,7 +2014,8 @@ def main():
         # Digital zoom is applied first so every downstream step (detection,
         # exposure sampling, gamma correction, cropping on save) operates on
         # the already-zoomed frame and stays geometrically consistent.
-        raw_frame = apply_digital_zoom(raw_frame_full, cfg.zoom_factor)
+        # pan_x/pan_y are owned by the auto-zoom-toward-leaf logic below.
+        raw_frame = apply_digital_zoom(raw_frame_full, cfg.zoom_factor, cfg.pan_x, cfg.pan_y)
         # Correct any global color cast (e.g. cyan/teal tint) before the
         # frame is used for anything else - detection, exposure sampling,
         # and gamma correction all assume roughly neutral color.
@@ -1728,8 +2039,76 @@ def main():
         apply_hysteresis = was_confirmed and not cold_recheck
 
         leaf_mask, bbox, area_ratio, detect_debug = detect_leaf(
-            frame, cfg, prev_bbox=prev_bbox, apply_hysteresis=apply_hysteresis)
+            frame, cfg, prev_bbox=prev_bbox, apply_hysteresis=apply_hysteresis,
+            debug=cfg.show_debug_mask)
         leaf_found = bbox is not None
+
+        # --- Auto-zoom toward the leaf --------------------------------------
+        # Adjusts cfg.zoom_factor/pan_x/pan_y for the NEXT frame
+        # (apply_digital_zoom runs at the top of the loop, one frame ahead -
+        # a normal visual-servoing lag). Goal: narrow the field of view onto
+        # the leaf BEFORE relying on the detector for anything else, so a
+        # wide/cluttered shot (background, tripod, other objects) gets
+        # cropped away and only a clean, leaf-dominated view ever reaches the
+        # detection/quality/capture logic below - exactly like a person
+        # framing a photo by hand before deciding it looks right.
+        #
+        # Reacts to the RAW per-frame detection (bbox), not a confirmed/
+        # smoothed track - detect_leaf's own color/shape/size gates already
+        # filter out most non-leaf clutter before ever returning a bbox at
+        # all, so this is a reasonably trustworthy signal to steer toward
+        # even before the tracker has "confirmed" a stable identity.
+        if leaf_found:
+            zoom_lost_since = None
+            zx, zy, zw, zh = bbox
+            leaf_cx, leaf_cy = zx + zw / 2.0, zy + zh / 2.0
+            zframe_h, zframe_w = frame.shape[:2]
+            err_x = (leaf_cx - zframe_w / 2.0) / zframe_w
+            err_y = (leaf_cy - zframe_h / 2.0) / zframe_h
+            centered = (abs(err_x) <= cfg.auto_zoom_center_tol
+                        and abs(err_y) <= cfg.auto_zoom_center_tol)
+            well_sized = cfg.auto_zoom_target_low <= area_ratio <= cfg.auto_zoom_target_high
+
+            if not centered:
+                # Off-center takes priority over zooming further - zooming
+                # in on an off-center leaf risks cropping it out of frame
+                # entirely before it's ever properly framed.
+                step = cfg.auto_pan_step
+                cfg.pan_x = float(np.clip(
+                    cfg.pan_x + np.clip(err_x, -step, step) / cfg.zoom_factor, 0.0, 1.0))
+                cfg.pan_y = float(np.clip(
+                    cfg.pan_y + np.clip(err_y, -step, step) / cfg.zoom_factor, 0.0, 1.0))
+            elif not well_sized:
+                if area_ratio < cfg.auto_zoom_target_low:
+                    cfg.zoom_factor = min(cfg.zoom_factor + cfg.auto_zoom_step, cfg.zoom_max)
+                else:
+                    cfg.zoom_factor = max(cfg.zoom_factor - cfg.auto_zoom_step, cfg.zoom_min)
+            # else: leaf is centered AND at a good size - stop adjusting and
+            # let the rest of this loop (detection/quality/capture, all
+            # unchanged) run exactly as it always has, on this now-clean,
+            # zoomed-in view.
+
+            # Keep the Controls window's Zoom slider showing the live
+            # auto-zoom value, so it doesn't look frozen/stuck to a user
+            # watching it. read_controls() reads this same slider back at
+            # the top of next frame's loop - but since it's now showing
+            # the value auto-zoom just set, that read-back is a no-op;
+            # auto-zoom then adjusts further from there based on the next
+            # frame's own detection. No feedback loop, just harmless
+            # round-tripping while a leaf is being actively tracked.
+            cv2.setTrackbarPos(SLIDER_ZOOM, CONTROLS_WIN, int(round(cfg.zoom_factor * 100)))
+        else:
+            zoom_now = time.time()
+            if zoom_lost_since is None:
+                zoom_lost_since = zoom_now
+            elif (zoom_now - zoom_lost_since) > cfg.auto_zoom_lost_reset_sec:
+                # Leaf has been missing for a while - give up and reset to a
+                # neutral wide view to search again, rather than staying
+                # zoomed in on empty space (or clutter) indefinitely.
+                cfg.zoom_factor = cfg.zoom_min
+                cfg.pan_x, cfg.pan_y = 0.5, 0.5
+        # ---------------------------------------------------------------------
+
         # display_bbox is the smoothed/held box (see LeafTracker), fed back
         # in as next frame's continuity hint.
         display_bbox = tracker.update(bbox)
@@ -1899,6 +2278,15 @@ def main():
         if display_bbox is not None:
             draw_leaf_bbox(display, display_bbox)
 
+        # Visualize the fixed exclusion zone (see Config.ignore_bottom_frac)
+        # so it's directly visible/verifiable against the actual rig,
+        # rather than a number that's hard to judge without seeing it.
+        if cfg.ignore_bottom_frac > 0:
+            excl_y = int(display.shape[0] * (1.0 - cfg.ignore_bottom_frac))
+            cv2.line(display, (0, excl_y), (display.shape[1], excl_y), (0, 140, 255), 2, cv2.LINE_AA)
+            cv2.putText(display, "excluded from detection below this line",
+                        (16, excl_y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1, cv2.LINE_AA)
+
         now = time.time()
 
         # Progressive floor relaxation: the longer this leaf has sat
@@ -2006,6 +2394,17 @@ def main():
                   f"sharp={sharpness:.0f}/{sharp_thresh:.0f}  vein={vein_score:.1f}/{vein_thresh:.1f}  "
                   f"adaptive={ready_str}  mode={mode_str}  track={track_str}{refine_str}  "
                   f"zoom={cfg.zoom_factor:.2f}x  exposure={exposure_ctrl.last_status}")
+            # Raw camera property readback, printed every status tick (not
+            # just once at startup) - the fastest way to tell whether
+            # "exposure stays too high" is a software logic issue (these
+            # numbers should visibly move toward the baseline over a few
+            # seconds) or the camera driver just not honoring writes at all
+            # (these numbers never move no matter what the software does).
+            print(f"  [camera] AUTO_EXPOSURE={cap.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f}  "
+                  f"EXPOSURE={cap.get(cv2.CAP_PROP_EXPOSURE):.2f}  "
+                  f"GAIN={cap.get(cv2.CAP_PROP_GAIN):.2f}  "
+                  f"BRIGHTNESS={cap.get(cv2.CAP_PROP_BRIGHTNESS):.2f}  "
+                  f"frame_mean={exposure_mean_ema:.1f}")
             last_status_print = now
 
         draw_overlay(display, guidance_text, score, leaf_present,
