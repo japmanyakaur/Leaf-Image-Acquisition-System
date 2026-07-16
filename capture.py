@@ -177,9 +177,8 @@ class Config:
     auto_zoom_target_low: float = 0.15
     auto_zoom_target_high: float = 0.35
     # How far off-center (as a fraction of frame width/height) the leaf
-    # may be before auto-zoom is considered "aimed" and allowed to zoom
-    # further; while off-center by more than this, panning takes priority
-    # over zooming so an off-center leaf doesn't get cropped out of frame.
+    # may be before auto-zoom considers it FULLY "aimed" (panning stops
+    # adjusting once inside this).
     auto_zoom_center_tol: float = 0.10
     auto_zoom_step: float = 0.04        # zoom_factor change per frame
     auto_pan_step: float = 0.06         # max pan-fraction shift per frame
@@ -571,11 +570,16 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
             rejected["luma"] += 1
             continue
         relative_margin = color_margin / max(mean_luma, 1.0)
-        if color_margin <= 4.0 or relative_margin <= 0.04:
-            # Tightened from 0.9/0.022 - that was loose enough to let
-            # objects with only a faint greenish cast (ambient color cast,
-            # slight sensor noise) clear the bar and be accepted as "the
-            # leaf" just for being the biggest/only candidate around.
+        if color_margin <= 10.0 or relative_margin <= 0.04:
+            # Raised from 4.0 based on per-candidate debug metrics (mean_bgr/
+            # color_margin/green_fraction, printed for every survivor) captured
+            # live: a large, weakly-green background/wall region consistently
+            # measured color_margin 6-9 across dozens of frames and won purely
+            # on size (10-15x the real leaf's area), while the actual leaf -
+            # in the same frames - consistently measured color_margin >= 10.2.
+            # 4.0 was loose enough to accept that background blob as "the
+            # leaf" just for being the biggest candidate around; 10.0 sits
+            # in the clean gap between the two populations seen in that data.
             rejected["color_margin"] += 1
             continue  # not actually green-dominant - never let this win on size alone
 
@@ -632,7 +636,9 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
         size_factor = min(area_ratio / size_saturation_ratio, 1.0) if size_saturation_ratio > 0 else area_ratio
         score = size_factor * (1.0 + min(color_margin, 60.0) / 60.0) * shape_factor
         candidates.append({"mask": candidate_mask, "bbox": (x, y, w, h),
-                            "area_ratio": area_ratio, "score": score})
+                            "area_ratio": area_ratio, "score": score,
+                            "color_margin": color_margin, "green_fraction": green_fraction,
+                            "mean_sat": float(np.mean(sat_values)), "mean_bgr": (cb, cg, cr)})
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
     if debug:
@@ -641,6 +647,17 @@ def _score_candidates(frame, mask, frame_area, max_ratio=0.75, min_ratio=0.003, 
         top_score = candidates[0]["score"] if candidates else None
         print(f"    [{debug_label}] {len(contours)} raw contours -> {survived} survived all gates "
               f"(rejected: {rejected}) -> top candidate bbox={top} score={top_score}")
+        # Per-candidate metrics for every survivor (not just the winner) -
+        # this is what actually shows WHY a candidate won: whether it's
+        # genuinely strong on color/purity or just large (size_factor),
+        # and lets a false-positive winner's color_margin/green_fraction be
+        # compared directly against the true leaf candidate sitting right
+        # next to it in the same list.
+        for i, c in enumerate(candidates):
+            print(f"      [{debug_label}] #{i} bbox={c['bbox']} area_ratio={c['area_ratio']:.4f} "
+                  f"score={c['score']:.3f} color_margin={c['color_margin']:.1f} "
+                  f"green_fraction={c['green_fraction']:.2f} mean_sat={c['mean_sat']:.1f} "
+                  f"mean_bgr=({c['mean_bgr'][0]:.0f},{c['mean_bgr'][1]:.0f},{c['mean_bgr'][2]:.0f})")
     return candidates[:top_k]
 
 
@@ -1647,9 +1664,26 @@ def refine_bbox_with_rembg(frame_bgr, fallback_bbox, session, cfg: Config):
         return fallback_bbox  # not green - don't trust it over the contour box
 
     x, y, w, h = cv2.boundingRect(largest)
+    candidate_bbox = (x, y, w, h)
+    # rembg is class-agnostic salient-object detection with NO notion of
+    # "leaf" - `largest` is just whatever single object it found most
+    # visually prominent in the ENTIRE frame, which can be a completely
+    # different object (a knob, a clip, a reflection) than the leaf the
+    # contour detector was actually tracking. The color-margin gate above
+    # only checks "is this greenish", which a weakly-lit object can clear
+    # by chance - it does NOT check "is this the same object". Confirmed
+    # live: the on-screen box was correctly on the leaf, but the saved
+    # photo was a completely unrelated round object elsewhere in frame,
+    # because rembg's pick barely passed the color gate with no positional
+    # relationship to what was being tracked. Requiring real overlap with
+    # the contour bbox is what makes this a REFINEMENT of the tracked
+    # object's edges, rather than a silent replacement with something else.
+    if fallback_bbox is not None and _bbox_iou(candidate_bbox, fallback_bbox) < 0.15:
+        return fallback_bbox  # not the same object - don't trust it over the contour box
+
     print(f"  [rembg] refined crop: ({x},{y},{w},{h})"
           + (f"  (contour had {fallback_bbox})" if fallback_bbox is not None else "  (contour found nothing)"))
-    return (x, y, w, h)
+    return candidate_bbox
 
 
 def _beep():
@@ -2070,9 +2104,6 @@ def main():
             well_sized = cfg.auto_zoom_target_low <= area_ratio <= cfg.auto_zoom_target_high
 
             if not centered:
-                # Off-center takes priority over zooming further - zooming
-                # in on an off-center leaf risks cropping it out of frame
-                # entirely before it's ever properly framed.
                 step = cfg.auto_pan_step
                 cfg.pan_x = float(np.clip(
                     cfg.pan_x + np.clip(err_x, -step, step) / cfg.zoom_factor, 0.0, 1.0))
@@ -2083,10 +2114,8 @@ def main():
                     cfg.zoom_factor = min(cfg.zoom_factor + cfg.auto_zoom_step, cfg.zoom_max)
                 else:
                     cfg.zoom_factor = max(cfg.zoom_factor - cfg.auto_zoom_step, cfg.zoom_min)
-            # else: leaf is centered AND at a good size - stop adjusting and
-            # let the rest of this loop (detection/quality/capture, all
-            # unchanged) run exactly as it always has, on this now-clean,
-            # zoomed-in view.
+            # else: leaf is centered AND at a good size - nothing more to
+            # do this frame.
 
             # Keep the Controls window's Zoom slider showing the live
             # auto-zoom value, so it doesn't look frozen/stuck to a user
@@ -2177,6 +2206,9 @@ def main():
         # read as "too dark" and drive exposure/gain up even while the
         # actual leaf is fine or already blown out. Two independent
         # guards against that:
+
+
+        
         #   1. Erode the mask before sampling - contamination is
         #      concentrated at the boundary where a merged blob fused
         #      with the background, so pixels solidly inside the
