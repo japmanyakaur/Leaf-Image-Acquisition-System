@@ -158,7 +158,7 @@ An image is captured only when all required acquisition conditions are satisfied
 Clone the repository:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/japmanyakaur/Leaf-Image-Acquisition-System
 cd Leaf-Image-Acquisition-System
 ```
 
