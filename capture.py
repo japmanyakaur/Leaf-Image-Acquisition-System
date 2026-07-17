@@ -180,12 +180,35 @@ class Config:
     # may be before auto-zoom considers it FULLY "aimed" (panning stops
     # adjusting once inside this).
     auto_zoom_center_tol: float = 0.10
+    # A SEPARATE, LOOSER tolerance that only gates whether zoom is allowed
+    # to run at all - NOT the same as auto_zoom_center_tol above, which
+    # only controls when panning stops fine-adjusting. apply_digital_zoom
+    # is a complete no-op while zoom_factor<=1.001 (see its own docstring),
+    # so panning has ZERO visible effect on the frame until zoom has
+    # already taken its first step. If zoom were gated behind the tight
+    # `centered` check using the SAME tolerance as panning, a leaf that
+    # starts out more than auto_zoom_center_tol off-center could never be
+    # centered by panning (since panning does nothing yet) and zoom could
+    # never start - a permanent deadlock. This looser tolerance lets zoom
+    # begin as soon as the leaf is roughly aimed at, while still refusing
+    # to zoom when it's close enough to a frame edge that zooming could
+    # crop it out entirely - the actual risk this check exists to prevent.
+    auto_zoom_safe_to_zoom_tol: float = 0.30
     auto_zoom_step: float = 0.04        # zoom_factor change per frame
     auto_pan_step: float = 0.06         # max pan-fraction shift per frame
     # If the leaf has been missing this long, give up and reset back to a
     # neutral wide view to search again, rather than staying zoomed in on
     # empty space.
     auto_zoom_lost_reset_sec: float = 2.0
+    # If zoom has been pushing the SAME direction (in, or out) for this
+    # long without area_ratio actually improving by at least
+    # auto_zoom_stall_improve_eps, stop pushing further rather than
+    # continuing indefinitely - guards against a runaway zoom-in that
+    # never actually converges (e.g. panning lagging behind a tight crop,
+    # so the visible leaf fraction never grows the way zooming-in expects
+    # it to).
+    auto_zoom_stall_timeout_sec: float = 2.5
+    auto_zoom_stall_improve_eps: float = 0.015
 
     # --- Cluttered-background robustness ---
     # Candidate contours whose w/h ratio falls outside this range are
@@ -2000,6 +2023,12 @@ def main():
     tracker = LeafTracker(cfg.bbox_smooth_alpha, cfg.bbox_hold_frames)
     prev_bbox = None  # last tracked box, fed back in as a continuity hint
     zoom_lost_since = None  # wall-clock time the leaf was last seen, for auto-zoom's reset-to-wide-view
+    # Stall guard for auto-zoom (see Config.auto_zoom_stall_timeout_sec):
+    # tracks whether area_ratio is actually improving while zoom pushes in
+    # a given direction, so a non-converging zoom-in doesn't run forever.
+    zoom_stall_direction = 0        # +1 zooming in, -1 zooming out, 0 idle
+    zoom_stall_reference_ratio = None
+    zoom_stall_since = None
     exposure_mean_ema = None  # EMA of the exposure-driving brightness reading
     gamma_mean_ema = None     # EMA of the gamma-driving brightness reading
     frame_idx = 0
@@ -2087,12 +2116,16 @@ def main():
         # detection/quality/capture logic below - exactly like a person
         # framing a photo by hand before deciding it looks right.
         #
-        # Reacts to the RAW per-frame detection (bbox), not a confirmed/
-        # smoothed track - detect_leaf's own color/shape/size gates already
-        # filter out most non-leaf clutter before ever returning a bbox at
-        # all, so this is a reasonably trustworthy signal to steer toward
-        # even before the tracker has "confirmed" a stable identity.
-        if leaf_found:
+        # Reacts to the tracker-CONFIRMED detection (held for at least
+        # continuity_min_confirmed_frames consecutive frames - the same
+        # bar hysteresis uses elsewhere, see LeafTracker/Config), not the
+        # raw per-frame bbox. A fleeting 1-2 frame false positive (a dark
+        # object briefly clearing the color/shape gates) can no longer
+        # yank pan/zoom toward it before the tracker has proven the lock
+        # is real; a genuine leaf still confirms within well under a
+        # second, so this costs negligible responsiveness.
+        zoom_track_confirmed = tracker.confirmed_frames >= cfg.continuity_min_confirmed_frames
+        if leaf_found and zoom_track_confirmed:
             zoom_lost_since = None
             zx, zy, zw, zh = bbox
             leaf_cx, leaf_cy = zx + zw / 2.0, zy + zh / 2.0
@@ -2101,21 +2134,62 @@ def main():
             err_y = (leaf_cy - zframe_h / 2.0) / zframe_h
             centered = (abs(err_x) <= cfg.auto_zoom_center_tol
                         and abs(err_y) <= cfg.auto_zoom_center_tol)
+            # Deliberately looser than `centered` - see
+            # Config.auto_zoom_safe_to_zoom_tol for why zoom must NOT be
+            # gated behind the tight centering check.
+            safe_to_zoom = (abs(err_x) <= cfg.auto_zoom_safe_to_zoom_tol
+                            and abs(err_y) <= cfg.auto_zoom_safe_to_zoom_tol)
             well_sized = cfg.auto_zoom_target_low <= area_ratio <= cfg.auto_zoom_target_high
 
+            # Pan and zoom are independent checks (not if/elif) - both can
+            # run in the same frame. Without this, zoom could never take
+            # its first step whenever the leaf started out more than
+            # auto_zoom_center_tol off-center, since panning has no visual
+            # effect at all until zoom_factor rises above 1.0 (a deadlock;
+            # see Config.auto_zoom_safe_to_zoom_tol).
             if not centered:
                 step = cfg.auto_pan_step
                 cfg.pan_x = float(np.clip(
                     cfg.pan_x + np.clip(err_x, -step, step) / cfg.zoom_factor, 0.0, 1.0))
                 cfg.pan_y = float(np.clip(
                     cfg.pan_y + np.clip(err_y, -step, step) / cfg.zoom_factor, 0.0, 1.0))
-            elif not well_sized:
-                if area_ratio < cfg.auto_zoom_target_low:
-                    cfg.zoom_factor = min(cfg.zoom_factor + cfg.auto_zoom_step, cfg.zoom_max)
-                else:
-                    cfg.zoom_factor = max(cfg.zoom_factor - cfg.auto_zoom_step, cfg.zoom_min)
-            # else: leaf is centered AND at a good size - nothing more to
-            # do this frame.
+
+            if well_sized:
+                # Reached the target - clear any stall tracking so a
+                # FUTURE need to zoom (leaf moves away, etc.) starts fresh.
+                zoom_stall_direction, zoom_stall_reference_ratio, zoom_stall_since = 0, None, None
+            elif not safe_to_zoom:
+                # Too far off-center to safely zoom this frame - not a
+                # stall (panning is still actively correcting), just skip.
+                pass
+            else:
+                direction = 1 if area_ratio < cfg.auto_zoom_target_low else -1
+                zoom_now = time.time()
+                if direction != zoom_stall_direction or zoom_stall_reference_ratio is None:
+                    # Direction just changed (or this is the first push) -
+                    # start a fresh reference point to measure progress
+                    # against.
+                    zoom_stall_direction = direction
+                    zoom_stall_reference_ratio = area_ratio
+                    zoom_stall_since = zoom_now
+                elif abs(area_ratio - zoom_stall_reference_ratio) >= cfg.auto_zoom_stall_improve_eps:
+                    # Real progress since the last checkpoint - reset the
+                    # clock rather than accumulating stall time forever.
+                    zoom_stall_reference_ratio = area_ratio
+                    zoom_stall_since = zoom_now
+
+                stalled = (zoom_stall_since is not None
+                           and (zoom_now - zoom_stall_since) > cfg.auto_zoom_stall_timeout_sec)
+                if not stalled:
+                    if direction > 0:
+                        cfg.zoom_factor = min(cfg.zoom_factor + cfg.auto_zoom_step, cfg.zoom_max)
+                    else:
+                        cfg.zoom_factor = max(cfg.zoom_factor - cfg.auto_zoom_step, cfg.zoom_min)
+                # else: this direction hasn't actually improved area_ratio
+                # in a while (e.g. the leaf drifting toward the crop edge
+                # as fast as zoom tightens) - hold zoom where it is instead
+                # of continuing to push it further with nothing to show
+                # for it.
 
             # Keep the Controls window's Zoom slider showing the live
             # auto-zoom value, so it doesn't look frozen/stuck to a user
@@ -2126,6 +2200,13 @@ def main():
             # frame's own detection. No feedback loop, just harmless
             # round-tripping while a leaf is being actively tracked.
             cv2.setTrackbarPos(SLIDER_ZOOM, CONTROLS_WIN, int(round(cfg.zoom_factor * 100)))
+        elif leaf_found:
+            # Found, but the tracker hasn't confirmed it yet (normal for
+            # the first fraction of a second of any fresh lock) - hold
+            # pan/zoom steady and do NOT count this as "lost" below, or a
+            # slow-to-confirm lock could spuriously reset zoom back to a
+            # wide view before it ever got a real chance to act.
+            zoom_lost_since = None
         else:
             zoom_now = time.time()
             if zoom_lost_since is None:
