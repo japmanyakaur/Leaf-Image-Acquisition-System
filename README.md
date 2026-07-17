@@ -2,7 +2,7 @@
 
 A modular computer vision system for automatic leaf localization, tracking, quality assessment, and image acquisition.
 
-Developed as part of research in Controlled Environment Agriculture (CEA) and plant phenotyping workflows, the system automatically identifies a leaf, evaluates image quality, adjusts framing, and captures leaf images with minimal user intervention.
+Developed as part of research and plant phenotyping workflows, the system automatically identifies a leaf, evaluates image quality, adjusts framing, and captures leaf images with minimal user intervention.
 
 ---
 
