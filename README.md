@@ -211,7 +211,7 @@ python leaf_capture/main.py
 
 B.Tech Computer Science & Engineering  
 
-Research Internship – IIT Mandi
+Research Intern – IIT Mandi
 
 ---
 
