@@ -8,10 +8,6 @@ FHD webcam vs your laptop's built-in camera.
 USAGE
     python find_camera.py
 
-Watch each window as it opens. Note the index number shown on screen when
-the Lenovo feed appears. Press any key to skip to the next index early,
-or just wait for the 4-second timer.
-
 Once you know the right index, open leaf_capture_system.py and change:
     camera_index: int = 0
 to the index that showed your Lenovo webcam.
