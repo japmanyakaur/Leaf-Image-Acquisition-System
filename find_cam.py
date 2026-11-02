@@ -8,7 +8,7 @@ FHD webcam vs your laptop's built-in camera.
 USAGE
     python find_camera.py
 
-Once you know the right index, open leaf_capture_system.py and change:
+Once right index is known, open leaf_capture_system.py and change:
     camera_index: int = 0
 to the index that showed your Lenovo webcam.
 """
